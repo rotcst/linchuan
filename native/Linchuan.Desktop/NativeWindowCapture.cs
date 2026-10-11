@@ -25,6 +25,10 @@ internal static class NativeWindowCapture
     public static extern uint GetClipboardSequenceNumber();
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool OpenClipboard(IntPtr owner);
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetOpenClipboardWindow();
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
     [DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr GetClipboardData(uint format);
     [DllImport("user32.dll")]
@@ -58,11 +62,25 @@ internal static class NativeWindowCapture
     {
         get { var length = 512; return GetCurrentPackageFullName(ref length, new StringBuilder(length)) != 15700; }
     }
-    public static string ReadClipboardUnicode(Window window)
+    public static string ReadClipboardUnicode(Window window, uint expectedSequence)
     {
-        if (!OpenClipboard(new WindowInteropHelper(window).Handle)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        var owner = new WindowInteropHelper(window).Handle;
+        // Clipboard listeners can briefly hold the global lock after a successful copy.
+        for (var attempt = 0; ; attempt++)
+        {
+            if (GetClipboardSequenceNumber() != expectedSequence) throw new InvalidDataException("QA clipboard changed after the copy action.");
+            if (OpenClipboard(owner)) break;
+            var error = Marshal.GetLastWin32Error();
+            if (error != 5 || attempt >= 9)
+            {
+                _ = GetWindowThreadProcessId(GetOpenClipboardWindow(), out var lockingProcess);
+                throw new Win32Exception(error, $"QA clipboard could not be opened; lockingProcess={lockingProcess}.");
+            }
+            Thread.Sleep(25);
+        }
         try
         {
+            if (GetClipboardSequenceNumber() != expectedSequence) throw new InvalidDataException("QA clipboard changed before text was read.");
             var memory = GetClipboardData(13);
             if (memory == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
             var size = GlobalSize(memory).ToUInt64();

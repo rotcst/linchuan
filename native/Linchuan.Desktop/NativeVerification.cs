@@ -163,7 +163,7 @@ internal static class NativeVerification
         void Completed(string value) { actionRan = true; actionMatched = value == text; writeSequence = NativeWindowCapture.GetClipboardSequenceNumber(); }
         window.CopyCompleted += Completed;
         // Validate the public Windows text format independently of WPF's data-object reader.
-        try { button.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); var copied = NativeWindowCapture.ReadClipboardUnicode(window); Assert(actionRan && actionMatched && copied == text, $"native CF_UNICODETEXT; actionRan={actionRan}, actionMatched={actionMatched}, expectedLength={text.Length}, actualLength={copied.Length}, externalChange={writeSequence != NativeWindowCapture.GetClipboardSequenceNumber()}"); }
+        try { button.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); var copied = NativeWindowCapture.ReadClipboardUnicode(window, writeSequence); Assert(actionRan && actionMatched && copied == text && writeSequence == NativeWindowCapture.GetClipboardSequenceNumber(), $"native CF_UNICODETEXT; actionRan={actionRan}, actionMatched={actionMatched}, expectedLength={text.Length}, actualLength={copied.Length}, externalChange={writeSequence != NativeWindowCapture.GetClipboardSequenceNumber()}"); }
         finally { window.CopyCompleted -= Completed; if (existing is null) Clipboard.Clear(); else Clipboard.SetDataObject(snapshot, true); }
     }
     public static void Screenshot(Window window, string file) { window.UpdateLayout(); NativeWindowCapture.Save(window, file, ((AppWindow)window).CaptionResource); }
