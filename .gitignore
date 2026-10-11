@@ -1,0 +1,14 @@
+node_modules/
+dist/
+build/
+release/
+data/
+qa/
+runtime/*.exe
+*.log
+*.zip
+.env
+.env.*
+!.env.example
+*.sqlite-shm
+*.sqlite-wal
