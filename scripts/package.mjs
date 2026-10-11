@@ -46,6 +46,12 @@ try {
 } catch (error) {
   if (error.code !== 'ENOENT') throw error;
 }
+// node_modules is fully owned by the package. Rebuild it on every package
+// run so a previous release cannot omit package metadata required by Node's
+// package exports (for example @img/sharp-win32-x64/package.json).
+const nodeModulesDestination = path.join(destination, 'node_modules');
+await assertManagedTarget(nodeModulesDestination);
+await fs.rm(nodeModulesDestination, { recursive: true, force: true });
 for (const name of [
   '启动邻传.cmd',
   '启动邻传.ps1',

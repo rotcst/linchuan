@@ -5,16 +5,16 @@
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$buildRoot = [IO.Path]::GetFullPath((Join-Path $root 'build'))
-$checkRoot = [IO.Path]::GetFullPath((Join-Path $buildRoot ('launcher-check-' + [guid]::NewGuid().ToString('N'))))
+$tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar)
+$checkRoot = [IO.Path]::GetFullPath((Join-Path $tempRoot ('linchuan-launcher-check-' + [guid]::NewGuid().ToString('N'))))
 $appDir = Join-Path $checkRoot 'app'
 $dataDir = Join-Path $checkRoot 'data'
 $exe = Join-Path $root 'release\Linchuan.exe'
 
 function Assert-SafeTempRoot([string]$path) {
   $resolved = [IO.Path]::GetFullPath($path).TrimEnd([IO.Path]::DirectorySeparatorChar)
-  $buildPrefix = $buildRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
-  if (!$resolved.StartsWith($buildPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw "测试目录越界：$resolved" }
+  $tempPrefix = $tempRoot + [IO.Path]::DirectorySeparatorChar
+  if (!$resolved.StartsWith($tempPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw "测试目录越界：$resolved" }
   if (Test-Path -LiteralPath $resolved) {
     $item = Get-Item -LiteralPath $resolved
     if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "测试目录不能是 reparse point：$resolved" }
