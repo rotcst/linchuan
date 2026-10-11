@@ -77,10 +77,10 @@ node scripts/fetch-runtime.mjs
 npm run package
 dotnet build native/Linchuan.Desktop/Linchuan.Desktop.csproj -c Release
 dotnet run --project native/Linchuan.Desktop.Tests -c Release
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-desktop.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-desktop.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build-desktop.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/test-desktop.ps1
 ```
 
-ソース開発には Node.js 24.14.1 以上と Windows の .NET 10 SDK が必要です。利用者は別途ランタイムをインストールする必要がありません。ホットリロードでは `npm run server:dev` と `npm run dev` を別々に実行します。ブラウザーおよびネイティブテストは隔離した一時データを使い、ネイティブ検証は実際の WPF コントロール、WebSocket のオンライン状態、プライバシー、多重チャンク SHA-256 転送、ギャラリー、4 言語、2 テーマを確認して `qa/native` にスクリーンショットを保存します。
+ソース開発には Node.js 24.14.1 以上と Windows の .NET 10 SDK および PowerShell 7 が必要です。利用者は別途ランタイムをインストールする必要がありません。ホットリロードでは `npm run server:dev` と `npm run dev` を別々に実行します。ブラウザーおよびネイティブテストは隔離した一時データを使い、ネイティブ検証は実際の WPF コントロール、WebSocket のオンライン状態、プライバシー、多重チャンク SHA-256 転送、ギャラリー、4 言語、2 テーマを確認して `qa/native` にスクリーンショットを保存します。
 
 両方のインターフェースは中国語簡体字、英語、韓国語、日本語、丸い国旗メニュー、ライト・チャコールダーク・システムテーマに対応します。チャット本文とユーザーが設定した端末名は翻訳しません。参加時に以前のコンピューターの端末 ID を明示的に選ぶと、個別履歴と非表示状態を維持できます。この ID 取り込み API はリモートおよびブラウザー Origin の要求を拒否します。

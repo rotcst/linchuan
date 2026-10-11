@@ -33,5 +33,7 @@ jobs:
       - run: npm run package
       - run: dotnet build native/Linchuan.Desktop/Linchuan.Desktop.csproj -c Release
       - run: dotnet run --project native/Linchuan.Desktop.Tests -c Release
-      - run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-desktop.ps1
-      - run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-desktop.ps1
+      - shell: pwsh
+        run: ./scripts/build-desktop.ps1
+      - shell: pwsh
+        run: ./scripts/test-desktop.ps1

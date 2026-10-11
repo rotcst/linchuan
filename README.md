@@ -63,11 +63,11 @@ node scripts/fetch-runtime.mjs
 npm run package
 dotnet build native/Linchuan.Desktop/Linchuan.Desktop.csproj -c Release
 dotnet run --project native/Linchuan.Desktop.Tests -c Release
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-desktop.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-desktop.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build-desktop.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/test-desktop.ps1
 ```
 
-Building the native app requires the .NET 10 SDK on Windows; end users need no separate runtime installation. Browser and native tests use isolated temporary data. The native harness exercises actual WPF controls, WebSocket presence, privacy, multi-chunk SHA-256 transfer, gallery, four languages and both themes, and writes screenshots under `qa/native`.
+Building the native app requires the .NET 10 SDK and PowerShell 7 on Windows; end users need no separate runtime installation. Browser and native tests use isolated temporary data. The native harness exercises actual WPF controls, WebSocket presence, privacy, multi-chunk SHA-256 transfer, gallery, four languages and both themes, and writes screenshots under `qa/native`.
 
 For source development, install Node.js 24.14.1 or newer and run `npm ci`; use `npm start` after building. For hot reload, run `npm run server:dev` and `npm run dev` separately.
 

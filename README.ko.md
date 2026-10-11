@@ -77,10 +77,10 @@ node scripts/fetch-runtime.mjs
 npm run package
 dotnet build native/Linchuan.Desktop/Linchuan.Desktop.csproj -c Release
 dotnet run --project native/Linchuan.Desktop.Tests -c Release
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-desktop.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-desktop.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build-desktop.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/test-desktop.ps1
 ```
 
-소스 개발에는 Node.js 24.14.1 이상과 Windows의 .NET 10 SDK가 필요합니다. 최종 사용자는 별도의 런타임을 설치할 필요가 없습니다. `npm run server:dev`와 `npm run dev`를 각각 실행하면 서버와 휴대폰 페이지를 개발할 수 있습니다. 브라우저 및 네이티브 테스트는 격리된 임시 데이터를 사용합니다. 네이티브 검증은 실제 WPF 컨트롤, WebSocket 상태, 개인정보 보호, 다중 청크 SHA-256 전송, 갤러리, 네 가지 언어와 두 테마를 확인하고 `qa/native`에 스크린샷을 기록합니다.
+소스 개발에는 Node.js 24.14.1 이상과 Windows의 .NET 10 SDK 및 PowerShell 7이 필요합니다. 최종 사용자는 별도의 런타임을 설치할 필요가 없습니다. `npm run server:dev`와 `npm run dev`를 각각 실행하면 서버와 휴대폰 페이지를 개발할 수 있습니다. 브라우저 및 네이티브 테스트는 격리된 임시 데이터를 사용합니다. 네이티브 검증은 실제 WPF 컨트롤, WebSocket 상태, 개인정보 보호, 다중 청크 SHA-256 전송, 갤러리, 네 가지 언어와 두 테마를 확인하고 `qa/native`에 스크린샷을 기록합니다.
 
 양쪽 인터페이스는 중국어 간체, 영어, 한국어, 일본어와 둥근 국기 메뉴, 밝은색·숯색 어두운색·시스템 테마를 지원합니다. 채팅 원문과 사용자가 정한 기기 이름은 번역하지 않습니다. 기존 컴퓨터의 기기 정체성을 명시적으로 선택해 개인 기록과 숨김 상태를 유지할 수 있습니다. 이 정체성 가져오기 API는 원격 및 브라우저 Origin 요청을 거부합니다.

@@ -73,13 +73,13 @@ node scripts/fetch-runtime.mjs
 npm run package
 dotnet build native/Linchuan.Desktop/Linchuan.Desktop.csproj -c Release
 dotnet run --project native/Linchuan.Desktop.Tests -c Release
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-desktop.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-desktop.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build-desktop.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/test-desktop.ps1
 ```
 
 浏览器测试需要 Playwright Chromium：`npx playwright install chromium`。测试启动独立临时服务，不触碰真实用户数据。
 
-原生源码在 `native/Linchuan.Desktop`，编译需要 Windows 和 .NET 10 SDK，用户无需另装运行时。开发手机页面时分别运行 `npm run server:dev` 和 `npm run dev`。原生验证使用独立临时服务，真实操作 WPF 控件并生成四语深浅截图到 `qa/native`。
+原生源码在 `native/Linchuan.Desktop`，编译需要 Windows、.NET 10 SDK 和 PowerShell 7，用户无需另装运行时。开发手机页面时分别运行 `npm run server:dev` 和 `npm run dev`。原生验证使用独立临时服务，真实操作 WPF 控件并生成四语深浅截图到 `qa/native`。
 
 两端均支持简体中文、英文、韩语和日语。圆形国旗菜单显示语言原生名称，主动选择后记住偏好。用户设备名、聊天原文不会被翻译。EXE 参数 `--local` 强制仅局域网；`--server https://你的地址` 可直接作为指定服务的桌面客户端。
 
