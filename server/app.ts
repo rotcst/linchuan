@@ -466,6 +466,7 @@ export function createLanServer(options: LanServerOptions) {
       maxFileBytes: options.maxFileBytes ?? null,
       maxStorageBytes: options.maxStorageBytes ?? null,
       publicUrl,
+      desktopApi: 2,
     }),
   );
   const hostOnly = (
@@ -485,12 +486,76 @@ export function createLanServer(options: LanServerOptions) {
       throw new HttpError(403, '此功能只能在服务电脑本机使用。');
     next();
   };
+  const desktopHostOnly = (
+    request: Request,
+    response: Response,
+    next: NextFunction,
+  ) => {
+    hostOnly(request, response, () => {
+      if (request.get('origin'))
+        throw new HttpError(403, '桌面身份接口不接受浏览器 Origin。');
+      next();
+    });
+  };
   app.get('/api/host', hostOnly, (_request, response) =>
     response.json({
       code: joinCode,
       joinLocked: storage.joinFailures() >= maxJoinFailures,
+      localUrl: `http://127.0.0.1:${boundPort()}`,
+      ...(publicUrl ? { publicUrl } : {}),
       ...options.hostStatus?.(),
     }),
+  );
+  app.get('/api/host/devices', desktopHostOnly, (_request, response) =>
+    response.json({
+      devices: [...devices.values()]
+        .filter((device) => device.type === 'computer')
+        .map((device) => ({ ...device })),
+    }),
+  );
+  app.post(
+    '/api/host/desktop-session',
+    desktopHostOnly,
+    (request, response) => {
+      checkRate(joinAttempts, `desktop:${request.ip || 'unknown'}`, 20);
+      checkRate(joinAttempts, 'global-desktop-attempts', 30);
+      if (storage.joinFailures() >= maxJoinFailures)
+        throw new HttpError(429, '加入已暂停，请在服务电脑刷新连接码。');
+      const { deviceId, code } = request.body ?? {};
+      const validCode =
+        typeof code === 'string' &&
+        /^\d{6}$/.test(code) &&
+        crypto.timingSafeEqual(Buffer.from(code), Buffer.from(joinCode));
+      const device =
+        typeof deviceId === 'string' ? devices.get(deviceId) : undefined;
+      if (!validCode || !device || device.type !== 'computer') {
+        storage.incrementJoinFailures();
+        throw new HttpError(401, '连接码或电脑设备不正确。');
+      }
+      if (
+        [...sessions.values()].filter((item) => item.expiresAt > Date.now())
+          .length >= 128
+      )
+        throw new HttpError(429, '已连接设备过多，请退出暂时不用的设备。');
+      const session: Session = {
+        token: token(),
+        deviceId: device.id,
+        expiresAt: Date.now() + sessionExpiryMs,
+      };
+      sessions.set(hashToken(session.token), session);
+      storage.saveSession(
+        hashToken(session.token),
+        device.id,
+        session.expiresAt,
+      );
+      response.setHeader('Set-Cookie', cookieFor(session, request));
+      response.json({
+        token: session.token,
+        device,
+        devices: publicDevices(),
+        messages: [],
+      });
+    },
   );
   app.post('/api/host/code', hostOnly, (_request, response) => {
     joinCode = String(crypto.randomInt(100000, 1000000));
@@ -514,9 +579,15 @@ export function createLanServer(options: LanServerOptions) {
       ].includes(value)
     )
       throw new HttpError(400, '只允许生成当前服务的二维码。');
-    response
-      .type('svg')
-      .send(await QRCode.toString(value, { type: 'svg', margin: 1 }));
+    if (request.query.format === 'png') {
+      response
+        .type('png')
+        .send(await QRCode.toBuffer(value, { type: 'png', margin: 1 }));
+    } else {
+      response
+        .type('svg')
+        .send(await QRCode.toString(value, { type: 'svg', margin: 1 }));
+    }
   });
   app.post('/api/join', (request, response) => {
     checkRate(joinAttempts, request.ip || 'unknown', 20);
@@ -1076,7 +1147,11 @@ export function createLanServer(options: LanServerOptions) {
     });
     sendSocket(
       socket,
-      JSON.stringify({ type: 'ready', deviceId: session.deviceId }),
+      JSON.stringify({
+        type: 'ready',
+        deviceId: session.deviceId,
+        devices: publicDevices(),
+      }),
     );
     broadcastPresence();
     const heartbeat = setInterval(() => {

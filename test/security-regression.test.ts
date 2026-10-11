@@ -65,6 +65,47 @@ test('恶意 Host 不能访问本机管理 API', async (t) => {
   assert.equal(status, 403);
 });
 
+test('桌面身份接口仅本机无 Origin，复用已有 computer 身份且 PNG QR 可用', async (t) => {
+  const x = await server();
+  t.after(x.close);
+  const joined = await fetch(`${x.base}/api/join`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      code: '123456',
+      deviceId: 'browser-computer',
+      name: '旧电脑',
+      type: 'computer',
+    }),
+  });
+  assert.equal(joined.status, 200);
+  const joinedDeviceId = (await joined.clone().json()).device.id;
+  const devices = await fetch(`${x.base}/api/host/devices`, {
+    headers: { 'x-linchuan-host': '1' },
+  });
+  assert.equal(devices.status, 200);
+  assert.deepEqual(
+    (await devices.json()).devices.map((item: { id: string }) => item.id),
+    [joinedDeviceId],
+  );
+  const originDenied = await fetch(`${x.base}/api/host/devices`, {
+    headers: { 'x-linchuan-host': '1', origin: x.base },
+  });
+  assert.equal(originDenied.status, 403);
+  const claimed = await fetch(`${x.base}/api/host/desktop-session`, {
+    method: 'POST',
+    headers: { 'x-linchuan-host': '1', 'content-type': 'application/json' },
+    body: JSON.stringify({ deviceId: joinedDeviceId, code: '123456' }),
+  });
+  assert.equal(claimed.status, 200);
+  assert.equal((await claimed.json()).device.id, joinedDeviceId);
+  const png = await fetch(
+    `${x.base}/api/qr?url=${encodeURIComponent(x.base)}&format=png`,
+  );
+  assert.equal(png.status, 200);
+  assert.equal(png.headers.get('content-type'), 'image/png');
+});
+
 test('本机 HTTP Cookie 不带 Secure，公网 HTTPS Cookie 带 Secure', async (t) => {
   const local = await server();
   t.after(local.close);

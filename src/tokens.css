@@ -105,6 +105,15 @@
   --select-option-height: 44px;
   --select-menu-padding: 5px;
   --select-gap: var(--space-2);
+  --tray-menu-bg: var(--color-surface);
+  --tray-menu-active-bg: var(--color-accent);
+  --tray-menu-active-text: var(--color-on-accent);
+  --tray-menu-width: 156px;
+  --tray-menu-padding: 5px;
+  --tray-menu-radius: 8px;
+  --tray-menu-option-radius: 6px;
+  --tray-menu-option-height: 32px;
+  --tray-menu-font-size: 13px;
   color-scheme: light;
 }
 :root[data-theme='dark'] {

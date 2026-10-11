@@ -70,6 +70,12 @@ test('host 控制 API 只接受 loopback + 允许的 Host 标志', async (t) => 
     'x-linchuan-host': '1',
   });
   assert.notEqual(allowed, 403);
+  const host = (await (
+    await fetch(`${x.base}/api/host`, {
+      headers: { host: '127.0.0.1', 'x-linchuan-host': '1' },
+    })
+  ).json()) as { localUrl: string };
+  assert.equal(host.localUrl, `http://127.0.0.1:${new URL(x.base).port}`);
   const wrong = await requestWithHost(`${x.base}/api/host`, {
     host: 'transfer.example.test',
     'x-linchuan-host': '1',
@@ -81,6 +87,35 @@ test('host 控制 API 只接受 loopback + 允许的 Host 标志', async (t) => 
     'x-forwarded-for': '198.51.100.5',
   });
   assert.equal(proxy, 403);
+});
+
+test('host API 仅在本机返回实际 loopback、公网入口和通道状态', async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'linchuan-host-url-'));
+  const lan = createLanServer({
+    port: 0,
+    host: '127.0.0.1',
+    dataDir: dir,
+    joinCode: '123456',
+    publicUrl: 'https://transfer.example.test',
+    hostStatus: () => ({ internet: 'disabled' }),
+  });
+  await lan.start();
+  t.after(async () => {
+    await lan.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const base = `http://127.0.0.1:${lan.getPort()}`;
+  const response = await fetch(`${base}/api/host`, {
+    headers: { host: '127.0.0.1', 'x-linchuan-host': '1' },
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    code: '123456',
+    joinLocked: false,
+    localUrl: `http://127.0.0.1:${lan.getPort()}`,
+    publicUrl: 'https://transfer.example.test',
+    internet: 'disabled',
+  });
 });
 
 test('发送方或接收方只隐藏自己的消息，第三方不能隐藏', async (t) => {

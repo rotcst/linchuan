@@ -97,9 +97,10 @@ export function mountMedia(app: Express, options: MediaOptions) {
     if (signature(bytes, file.ref.mime) !== 'image')
       return response.status(415).json({ error: '文件不是受支持的图片。' });
     const large = request.query.large === '1';
+    const format = request.query.format === 'png' ? 'png' : 'webp';
     const cache = path.join(
       previewDir,
-      `${file.ref.id}-${large ? 'large' : 'thumb'}.webp`,
+      `${file.ref.id}-${large ? 'large' : 'thumb'}.${format}`,
     );
     let task = inFlight.get(cache);
     if (!task) {
@@ -110,15 +111,24 @@ export function mountMedia(app: Express, options: MediaOptions) {
         } catch {
           const temp = `${cache}.${crypto.randomBytes(6).toString('hex')}.part`;
           try {
-            await sharp(file.path, { limitInputPixels: 64 * 1024 * 1024 })
+            const image = sharp(file.path, {
+              limitInputPixels: 64 * 1024 * 1024,
+            })
               .rotate()
               .resize(large ? 2048 : 640, large ? 2048 : 640, {
                 fit: 'inside',
                 withoutEnlargement: true,
-              })
-              .webp({ quality: 82 })
-              .timeout({ seconds: 30 })
-              .toFile(temp);
+              });
+            if (format === 'png')
+              await image
+                .png({ compressionLevel: 6 })
+                .timeout({ seconds: 30 })
+                .toFile(temp);
+            else
+              await image
+                .webp({ quality: 82 })
+                .timeout({ seconds: 30 })
+                .toFile(temp);
             await fs.rename(temp, cache);
             return cache;
           } finally {
@@ -140,7 +150,10 @@ export function mountMedia(app: Express, options: MediaOptions) {
         .status(status === 429 ? 429 : 415)
         .json({ error: status === 429 ? '预览队列已满。' : '图片无法解码。' });
     }
-    response.setHeader('Content-Type', 'image/webp');
+    response.setHeader(
+      'Content-Type',
+      format === 'png' ? 'image/png' : 'image/webp',
+    );
     response.setHeader('Cache-Control', 'private, max-age=86400');
     return response.sendFile(cache);
   });
@@ -181,6 +194,8 @@ export function mountMedia(app: Express, options: MediaOptions) {
       await Promise.allSettled([
         fs.rm(path.join(previewDir, `${id}-thumb.webp`), { force: true }),
         fs.rm(path.join(previewDir, `${id}-large.webp`), { force: true }),
+        fs.rm(path.join(previewDir, `${id}-thumb.png`), { force: true }),
+        fs.rm(path.join(previewDir, `${id}-large.png`), { force: true }),
       ]);
     },
   };

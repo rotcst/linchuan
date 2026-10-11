@@ -2,16 +2,11 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import { createLanServer } from './app.js';
+import { readPublicUrl } from './configuration.js';
 
 const dataDir = process.env.DATA_DIR ?? path.resolve('data');
 const internet = process.env.INTERNET === '1';
-let publicUrl = process.env.PUBLIC_URL;
-if (internet) {
-  const configuration = JSON.parse(
-    fs.readFileSync(path.join(dataDir, 'cloudflare.json'), 'utf8'),
-  ) as { publicUrl: string };
-  publicUrl = configuration.publicUrl;
-}
+const publicUrl = readPublicUrl(dataDir, process.env.PUBLIC_URL);
 let tunnel: ChildProcess | null = null;
 let restartTimer: ReturnType<typeof setTimeout>;
 let shuttingDown = false;
@@ -36,6 +31,7 @@ void lan
       `局域网访问: ${urls.length ? urls.join('、') : '未检测到局域网地址'}`,
     );
     console.log('连接码显示在本机网页中。文件和聊天记录持久保存。');
+    if (publicUrl) console.log(`已配置公网入口: ${publicUrl}`);
     if (internet) {
       const executable = path.resolve('runtime/cloudflared.exe');
       let tunnelToken: string;

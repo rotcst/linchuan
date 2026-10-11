@@ -61,6 +61,8 @@ for (const name of [
   '允许局域网访问.cmd',
   'README.md',
   'README.zh-CN.md',
+  'README.ko.md',
+  'README.ja.md',
   'SECURITY.md',
   'THIRD-PARTY-LICENSES.txt',
   'manifest.json',
@@ -82,14 +84,11 @@ for (const name of ['server.cjs', 'server.cjs.LEGAL.txt']) {
   }
 }
 for (const name of [
-  '启动邻传.cmd',
-  '启动邻传.ps1',
-  '启动邻传.vbs',
-  '启动互联网模式.cmd',
-  '启动互联网模式.vbs',
   '允许局域网访问.cmd',
   'README.md',
   'README.zh-CN.md',
+  'README.ko.md',
+  'README.ja.md',
   'SECURITY.md',
   'LICENSE',
 ])
@@ -203,7 +202,9 @@ await fs.copyFile(
 );
 const manifest = {
   product: '邻传',
-  version: '1.0.0',
+  version: JSON.parse(
+    await fs.readFile(path.join(root, 'package.json'), 'utf8'),
+  ).version,
   node: process.version,
   builtAt: new Date().toISOString(),
   files: {},
@@ -216,14 +217,11 @@ const packageDirectories = [
   'node_modules',
 ];
 const packageFiles = [
-  '启动邻传.cmd',
-  '启动邻传.ps1',
-  '启动邻传.vbs',
-  '启动互联网模式.cmd',
-  '启动互联网模式.vbs',
   '允许局域网访问.cmd',
   'README.md',
   'README.zh-CN.md',
+  'README.ko.md',
+  'README.ja.md',
   'SECURITY.md',
   'LICENSE',
   'THIRD-PARTY-LICENSES.txt',

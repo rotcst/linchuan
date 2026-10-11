@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>Linchuan</AssemblyName>
+    <Version>1.1.0</Version>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>false</EnableCompressionInSingleFile>
+    <PublishTrimmed>false</PublishTrimmed>
+    <ApplicationIcon Condition="Exists('Assets/app.ico')">Assets/app.ico</ApplicationIcon>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="../../src/tokens.css" LogicalName="tokens.css" />
+    <EmbeddedResource Include="../../src/locales/*.json" LogicalName="locales.%(Filename).json" />
+    <EmbeddedResource Include="Assets/*" LogicalName="assets.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="../../build/desktop-payload.zip" LogicalName="payload.zip" Condition="Exists('../../build/desktop-payload.zip')" />
+  </ItemGroup>
+</Project>

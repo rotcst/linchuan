@@ -12,3 +12,6 @@ runtime/*.exe
 !.env.example
 *.sqlite-shm
 *.sqlite-wal
+native/**/bin/
+native/**/obj/
+native/**/Assets/DOTNET-NOTICES.txt

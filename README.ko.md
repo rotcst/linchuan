@@ -1,0 +1,86 @@
+# Linchuan
+
+Linchuan은 가정용 LAN 또는 선택 사항인 HTTPS Cloudflare Tunnel을 통해 Windows PC와 휴대폰을 연결합니다. Windows에서는 브라우저나 WebView를 사용하지 않는 C# WPF 네이티브 앱을 실행하고, 휴대폰에서는 웹 인터페이스를 사용합니다. 온라인 기기, 공용·개인 채팅, 파일 보관 및 미디어 미리보기를 함께 제공합니다.
+
+[English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Windows 다운로드](https://github.com/rotcst/linchuan/releases) · [보안](SECURITY.md) · [디자인 시스템](design/设计说明.md)
+
+## 빠른 시작
+
+1. Windows 10/11 x64 컴퓨터 한 대에서 Releases의 **Linchuan.exe**를 내려받아 두 번 클릭합니다. 터미널이나 별도의 Node.js 설치는 필요하지 않습니다.
+2. 앱은 `%LOCALAPPDATA%\Linchuan\app`에 내장 프로그램 파일을 준비하고 `%LOCALAPPDATA%\Linchuan\data`에 서비스 데이터를 보관합니다. 창을 닫으면 트레이로 숨겨진 채 연결을 유지합니다. 트레이 또는 창의 **Linchuan 종료**는 이 인스턴스가 시작한 서비스만 중지합니다. EXE를 다시 실행하면 기존 창을 활성화합니다.
+3. 다른 Windows 컴퓨터에서도 같은 EXE를 실행한 뒤 초기 연결 창에서 첫 번째 컴퓨터의 주소와 연결 코드를 입력합니다. 휴대폰은 오른쪽 연결 패널의 QR 코드를 스캔하거나 LAN/HTTPS 주소를 열고 코드를 입력합니다. 웹페이지만으로 중지된 호스트를 시작할 수는 없습니다.
+4. Windows 방화벽이 LAN 연결을 차단하면 `%LOCALAPPDATA%\Linchuan\app\允许局域网访问.cmd`를 실행하고 관리자 확인을 승인합니다. 이 작업은 TCP 3939의 로컬 서브넷 접근만 허용합니다.
+
+단일 EXE에는 .NET 런타임, Node.js 백엔드 및 Cloudflare 런타임이 포함됩니다. 첫 실행 시 관리되는 파일을 추출하며 업데이트해도 서비스 데이터는 보존됩니다. 네이티브 세션 토큰은 현재 Windows 사용자용 DPAPI로 `%LOCALAPPDATA%\Linchuan\desktop`에 보호됩니다. 서명되지 않은 앱 경고가 표시될 수 있으므로 Releases에 게시된 SHA-256을 확인하십시오.
+
+## 버전 및 업데이트
+
+주 창 왼쪽 아래와 시스템 트레이 메뉴에 설치된 버전과 **업데이트 확인**이 표시됩니다. 수동 확인은 이 저장소의 최신 안정 GitHub Release를 조회합니다. 새 버전이 있으면 공식 Release 페이지를 열어 단일 EXE를 직접 내려받을 수 있습니다. 네트워크 실패, 최신 상태, 미리보기 버전이 최신 안정판보다 앞선 경우를 구분해 표시합니다. 확인 과정에서 채팅, 파일 또는 Tunnel 자격 증명을 업로드하지 않습니다.
+
+Release의 SHA-256을 확인한 뒤 **Linchuan 종료**를 선택하고 새 EXE를 실행하십시오. 기존 `data`와 `desktop` 디렉터리는 보존됩니다. 업데이트 확인은 파일을 자동 설치·실행하거나 서비스를 재시작하지 않습니다.
+
+## 호스트와 기기 사용
+
+항상 켜져 있고 절전 모드로 전환되지 않는 Windows 컴퓨터를 서비스 컴퓨터로 선택하십시오. 다른 PC는 같은 EXE를 실행해 연결할 수 있고, 휴대폰은 서비스 컴퓨터의 웹 주소를 사용합니다. 연결 창의 주소 목록에는 호스트 전용 `http://127.0.0.1:<실제 포트>`, 감지된 LAN 주소, 저장된 HTTPS 주소가 포함됩니다. loopback 주소는 호스트 컴퓨터에서만 사용할 수 있으며, 저장된 공개 주소가 목록에 있다고 Tunnel 연결이 보장되는 것은 아닙니다.
+
+공용 채팅은 참여한 모든 기기에 보내고, 왼쪽 기기 목록에서 개인 채팅을 선택할 수 있습니다. 휴대폰은 **기기** 목록을 엽니다. 파일은 클립 아이콘으로 선택하고 사진·동영상은 사진 아이콘으로 선택합니다. PC에서는 파일을 끌어다 놓을 수도 있습니다.
+
+## 인터넷 모드
+
+인터넷 모드는 선택 사항이며 Cloudflare Tunnel을 사용합니다. 설정 창에서 마스킹된 DNS 편집 토큰, 직접 소유한 호스트 이름, Cloudflare Zone ID 및 선택적인 Wrangler 경로를 입력합니다. 다른 프로젝트 체크아웃을 참조하지 않습니다. 기존 `data/cloudflare.json` 메타데이터는 설정 창의 초기값으로 사용됩니다.
+
+1. 공식 Cloudflare 문서에 따라 Wrangler를 설치하고 `wrangler login`, `wrangler whoami`로 계정을 확인합니다.
+2. EXE에서 `%LOCALAPPDATA%\Linchuan\app\scripts\配置固定域名.cmd`를 실행하고 전용 서브도메인과 Zone ID를 입력합니다. 창에 표시되는 정확한 DNS 레코드를 확인하십시오.
+3. **Linchuan 종료**를 선택한 후 **Linchuan.exe**를 다시 실행합니다. 이미 구성된 Tunnel은 자동으로 시작됩니다. `--local`은 LAN 전용 모드로 강제합니다.
+
+패키지에는 고정된 Cloudflare 런타임 바이너리가 포함됩니다. 소스 빌드에서는 `node scripts/fetch-runtime.mjs`가 공식 릴리스를 내려받고 고정 SHA-256을 검증합니다. Cloudflare Tunnel에는 라우터 포트 포워딩이 필요하지 않지만 앱과 의존성은 계속 실행되어야 합니다.
+
+## 데이터, 개인정보 및 백업
+
+`%LOCALAPPDATA%\Linchuan\data\linchuan.sqlite`에는 채팅·기기·파일 인덱스가 저장되고, 파일 본문은 `uploads`, 생성된 미리보기는 `previews`에 저장됩니다. 데이터는 기본적으로 유지되며 디스크 수준 암호화는 적용되지 않습니다. 한 기기에서 메시지를 숨겨도 원본 파일이나 다른 기기의 기록을 삭제하지 않습니다.
+
+백업하려면 먼저 서비스 컴퓨터에서 **Linchuan 종료**를 선택한 뒤 `data` 전체를 백업하십시오. 다른 사용자나 컴퓨터로 Tunnel을 옮기면 현재 Windows 사용자에 묶인 DPAPI 자격 증명을 다시 구성해야 합니다. `data` 폴더에는 채팅, 파일 및 Tunnel 자격 증명이 포함될 수 있으므로 공개하거나 전송하지 마십시오.
+
+LAN 트래픽은 HTTP이고 인터넷 모드는 구성한 호스트 이름의 HTTPS를 사용합니다. 종단 간 암호화는 제공하지 않습니다. 6자리 연결 코드와 요청 속도 제한은 편의 기능이며 신뢰할 수 있는 사용자, 방화벽 및 HTTPS를 대신하지 않습니다.
+
+소스/폴더 실행은 프로젝트 또는 패키지의 `data`를 사용하고 EXE는 위의 AppData 경로를 사용합니다. 이전 웹 호스트를 옮길 때는 `cloudflare.json`과 `tunnel-token.dpapi`를 실제 EXE 데이터 디렉터리에 함께 두고 같은 Windows 사용자로 유지하십시오. 패키지 개발 도구는 AppData 접근을 리디렉션할 수 있으므로 파일 탐색기에서 앱과 설정을 실행해 실제 경로를 확인하십시오. 기존 채팅 데이터베이스를 덮어쓰지 마십시오.
+
+## 파일 전송 및 미리보기
+
+파일 형식 필터나 인위적인 단일 파일 크기 제한은 없습니다. 파일은 8 MiB 청크로 스트리밍되며 한 번에 최대 20개를 순서대로 선택할 수 있습니다. 서버는 디스크에 최소 256 MiB 여유 공간을 남기는 정책을 사용합니다. 실제 전송 가능 여부는 디스크, 네트워크, 운영 체제 및 브라우저 기능에 따릅니다. 중단된 청크는 일시적인 네트워크 오류 후 재시도하며, 새로고침이나 서비스 재시작 뒤 미완료 전송은 파일을 다시 선택해야 합니다.
+
+이미지는 생성된 PNG 미리보기로 표시하고 원본은 변경하지 않습니다. Windows에서는 확대·축소, 드래그, 좌우 이동, 복사 및 기기별 삭제를 지원합니다. 동영상은 임시 캐시에 다운로드한 뒤 Windows 코덱으로 재생합니다. 코덱이 지원하지 않는 파일도 원본을 내려받을 수 있습니다. 휴대폰에서는 저장/공유 동작이 운영 체제 메뉴를 사용하며 웹페이지가 사진 라이브러리에 몰래 쓰지 않습니다.
+
+## 문제 해결
+
+- 연결되지 않으면 두 기기가 같은 비게스트 Wi-Fi에 있고 AP 격리가 꺼져 있는지 확인합니다.
+- 관리자 권한으로 `允许局域网访问.cmd`를 실행해 TCP 3939와 로컬 서브넷 방화벽 규칙을 만듭니다.
+- VPN 또는 가상 어댑터가 있으면 가정용 라우터에 연결된 LAN 주소를 선택합니다.
+- 네이티브 호스트 창에서 인터넷 상태를 확인합니다. 다른 기기가 연결하려면 호스트가 실행 중이고 온라인 상태이며 절전 중이 아니어야 합니다.
+- Cloudflare 1033은 정상 Tunnel 커넥터가 없다는 뜻입니다. 페이지는 열리지만 네이티브 클라이언트에 HTTP 403 또는 브라우저 챌린지가 표시되면 전용 호스트의 `/api/`와 `/ws`에 브라우저 전용 챌린지 규칙이 적용되었는지 확인하십시오. 네이티브 클라이언트는 자신을 `Linchuan/<version>`으로 식별하지만 JavaScript 챌린지를 수행할 수 없습니다. 조정 범위는 해당 서비스 호스트와 엔드포인트로 제한하고 앱 인증 및 속도 제한은 유지하십시오.
+
+## 개발 및 검사
+
+```powershell
+npm ci
+npm run lint
+npm run format:check
+npm run typecheck
+npm test
+npm audit --audit-level=moderate
+npm run build
+npx playwright install chromium
+npm run test:browser
+npx tsx scripts/language-check.ts
+npx tsx scripts/visual-check.ts
+node scripts/fetch-runtime.mjs
+npm run package
+dotnet build native/Linchuan.Desktop/Linchuan.Desktop.csproj -c Release
+dotnet run --project native/Linchuan.Desktop.Tests -c Release
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-desktop.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-desktop.ps1
+```
+
+소스 개발에는 Node.js 24.14.1 이상과 Windows의 .NET 10 SDK가 필요합니다. 최종 사용자는 별도의 런타임을 설치할 필요가 없습니다. `npm run server:dev`와 `npm run dev`를 각각 실행하면 서버와 휴대폰 페이지를 개발할 수 있습니다. 브라우저 및 네이티브 테스트는 격리된 임시 데이터를 사용합니다. 네이티브 검증은 실제 WPF 컨트롤, WebSocket 상태, 개인정보 보호, 다중 청크 SHA-256 전송, 갤러리, 네 가지 언어와 두 테마를 확인하고 `qa/native`에 스크린샷을 기록합니다.
+
+양쪽 인터페이스는 중국어 간체, 영어, 한국어, 일본어와 둥근 국기 메뉴, 밝은색·숯색 어두운색·시스템 테마를 지원합니다. 채팅 원문과 사용자가 정한 기기 이름은 번역하지 않습니다. 기존 컴퓨터의 기기 정체성을 명시적으로 선택해 개인 기록과 숨김 상태를 유지할 수 있습니다. 이 정체성 가져오기 API는 원격 및 브라우저 Origin 요청을 거부합니다.

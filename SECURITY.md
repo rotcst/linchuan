@@ -2,7 +2,7 @@
 
 ## Scope
 
-This policy covers the Linchuan application, its Node.js server, the Windows launchers, and the optional Cloudflare Tunnel setup. It does not cover the user's router, operating system, browser, Cloudflare account, or third-party runtime binaries.
+This policy covers the Linchuan application, its Node.js server, the native Windows desktop client, and the optional Cloudflare Tunnel setup. It does not cover the user's router, operating system, browser, Cloudflare account, or third-party runtime binaries.
 
 ## Current protections
 
@@ -13,12 +13,14 @@ This policy covers the Linchuan application, its Node.js server, the Windows lau
 - HTTP request bodies have a five-minute deadline. JSON bodies have a separate 15-second deadline, upload inactivity is limited to 120 seconds, and the HTTP server accepts at most 512 concurrent connections.
 - API errors do not return stack traces. Responses set no-store for APIs, no-referrer, frame denial, MIME sniffing protection, and a restrictive CSP.
 - Tunnel credentials are stored with Windows DPAPI for the current user. DNS tokens are entered through a masked local window and are not written to project files.
+- Native session tokens also use current-user Windows DPAPI. Local host-management and desktop-identity endpoints reject forwarded internet requests; desktop-identity endpoints additionally reject browser Origin headers. Native HTTP and WebSocket requests declare `Linchuan/<version>` and retain application authentication and same-origin checks.
+- Manual update checks use this repository's official GitHub latest-release API. Release links are restricted to HTTPS `github.com/rotcst/linchuan/releases/tag/` URLs without credentials or non-default ports. Checks do not upload application data or automatically install or run downloaded software.
 
 ## Verified checks
 
-The repository includes isolated integration tests for authentication, Host/Origin checks, WebSocket presence and reconnect, private/public ACLs, upload boundaries, path-safe filenames, media signatures, session expiry, persistence, persistent join locking, concurrent disk reservations, and slow JSON deadlines. The 2026-10-12 local run passed 45 tests, including localization coverage. Online npm audit reported zero known vulnerabilities. Browser regressions cover chat, media, four languages, both themes, shared dropdowns, keyboard interaction, focus styling and responsive layouts. This records checks performed on this revision; it is not a guarantee against future vulnerabilities.
+The repository includes isolated integration tests for authentication, Host/Origin checks, WebSocket presence and reconnect, private/public ACLs, upload boundaries, path-safe filenames, media signatures, session expiry, persistence, persistent join locking, concurrent disk reservations, and slow JSON deadlines. The 2026-10-12 local run passed 51 Node tests, including localization and native host API coverage. Online npm audit and the .NET package audit reported zero known vulnerabilities. Native core regressions cover safe payload extraction, DPAPI session persistence, host compatibility, real-service reconnect, update metadata boundaries and HTTP/WebSocket request identity. The local symbolic-link case was skipped because the test process lacked link-creation privileges. Browser regressions cover chat, media, four languages, both themes, shared dropdowns, keyboard interaction, focus styling and responsive layouts. This records checks performed on this revision; it is not a guarantee against future vulnerabilities.
 
-The browser uses a cookie-only WebSocket URL. The server also accepts a query token for older clients; such clients must avoid logging credential-bearing URLs. The bundled Windows launcher verifies every managed file against its embedded SHA-256 manifest and refuses paths outside its managed app directory.
+The browser and native client use cookie-authenticated WebSocket URLs. The server also accepts a query token for older clients; such clients must avoid logging credential-bearing URLs. The bundled Windows app verifies every managed file against its embedded SHA-256 manifest, refuses paths outside its managed app directory, and stages replacements before changing the installed app directory. Chat data is kept separately from managed program files.
 
 ## Limitations
 

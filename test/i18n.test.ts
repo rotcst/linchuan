@@ -17,6 +17,23 @@ const catalogs = Object.fromEntries(
 const variables = (text: string) =>
   [...text.matchAll(/\{\{(\w+)\}\}/g)].map((match) => match[1]).sort();
 
+test('native Windows UI uses the same complete language catalogs', () => {
+  for (const file of fs
+    .readdirSync('native/Linchuan.Desktop')
+    .filter((name) => name.endsWith('.cs'))) {
+    const code = fs.readFileSync(
+      path.join('native/Linchuan.Desktop', file),
+      'utf8',
+    );
+    for (const match of code.matchAll(
+      /(?:L\.T|Ui\.(?:Text|Button|AsyncButton)|Dialog)\("([^"\n]+)"/g,
+    )) {
+      if (/[\u3400-\u9fff]/.test(match[1]))
+        assert.ok(Object.hasOwn(catalogs.zh, match[1]), `${file}: ${match[1]}`);
+    }
+  }
+});
+
 test('four languages have complete catalogs and matching interpolation variables', () => {
   const keys = Object.keys(catalogs.zh).sort();
   for (const [language, catalog] of Object.entries(catalogs)) {
