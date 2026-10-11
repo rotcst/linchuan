@@ -146,14 +146,20 @@ internal static class NativeVerification
                 var screenshot = Path.Combine(directory, "native-tray-" + theme + ".png"); NativeWindowCapture.Save(menu, screenshot);
                 Assert(((SolidColorBrush)menu.Background).Color == ((SolidColorBrush)Ui.Brush("TraySurface")).Color, "tray popup surface uses current theme");
                 using (var bitmap = new System.Drawing.Bitmap(screenshot)) { var expected = ((SolidColorBrush)Ui.Brush("TraySurface")).Color; var scale = VisualTreeHelper.GetDpi(menu).DpiScaleY; var actual = bitmap.GetPixel(bitmap.Width / 2, (int)(4 * scale)); Assert(actual.R == expected.R && actual.G == expected.G && actual.B == expected.B, "actual tray popup background pixels match theme"); }
-                menu.RaiseEvent(new System.Windows.Input.KeyEventArgs(System.Windows.Input.Keyboard.PrimaryDevice, PresentationSource.FromVisual(menu), 0, System.Windows.Input.Key.Escape) { RoutedEvent = System.Windows.Input.Keyboard.PreviewKeyDownEvent }); Assert(!menu.IsOpen, "Escape dismisses tray menu");
+                menu.RaiseEvent(new System.Windows.Input.KeyEventArgs(System.Windows.Input.Keyboard.PrimaryDevice, PresentationSource.FromVisual(menu), 0, System.Windows.Input.Key.Escape) { RoutedEvent = System.Windows.Input.Keyboard.PreviewKeyDownEvent }); Assert(!menu.IsOpen, "Escape dismisses tray menu"); await WaitForTrayClosedAsync(menu);
             }
             var versionItem = menu.Items.OfType<MenuItem>().Single(item => AutomationProperties.GetAutomationId(item) == "TrayVersion"); var updateItem = menu.Items.OfType<MenuItem>().Single(item => AutomationProperties.GetAutomationId(item) == "TrayCheckUpdates"); Assert(versionItem.IsEnabled == false && updateItem.IsEnabled, "tray version and update commands are present");
-            menu.ShowForTray(); await Task.Delay(80); updateItem.RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent)); await Task.Delay(80); Assert(updates == 1 && !menu.IsOpen, "tray update command dispatched once");
-            menu.ShowForTray(); await Task.Delay(80); menu.Items.OfType<MenuItem>().Single(item => AutomationProperties.GetAutomationId(item) == "TrayOpen").RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent)); Assert(opened == 1 && window.IsVisible && !menu.IsOpen, "tray open command restores main window");
-            menu.ShowForTray(); await Task.Delay(80); menu.Items.OfType<MenuItem>().Last().RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent)); Assert(exited == 1 && !menu.IsOpen, "tray exit command dispatched once");
+            menu.ShowForTray(); await Task.Delay(80); updateItem.RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent)); await Task.Delay(80); Assert(updates == 1 && !menu.IsOpen, "tray update command dispatched once"); await WaitForTrayClosedAsync(menu);
+            menu.ShowForTray(); await Task.Delay(80); menu.Items.OfType<MenuItem>().Single(item => AutomationProperties.GetAutomationId(item) == "TrayOpen").RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent)); Assert(opened == 1 && window.IsVisible && !menu.IsOpen, "tray open command restores main window"); await WaitForTrayClosedAsync(menu);
+            menu.ShowForTray(); await Task.Delay(80); menu.Items.OfType<MenuItem>().Last().RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent)); Assert(exited == 1 && !menu.IsOpen, "tray exit command dispatched once"); await WaitForTrayClosedAsync(menu);
         }
         finally { menu.IsOpen = false; window.Show(); window.ChangeAppearance("zh", "dark"); }
+    }
+    private static async Task WaitForTrayClosedAsync(TrayMenu menu)
+    {
+        // WPF posts popup-unload cleanup after IsOpen changes; finish it before reopening.
+        await WaitAsync(() => !menu.IsOpen && PresentationSource.FromVisual(menu) is null);
+        await menu.Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.ContextIdle);
     }
     private static void VerifyCopy(MainWindow window, Button button, string text)
     {
