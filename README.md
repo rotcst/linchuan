@@ -47,6 +47,8 @@ LAN traffic uses HTTP. Internet mode uses HTTPS at the configured hostname. The 
 
 ## Development and checks
 
+The Windows client confirms copied messages, addresses and connection codes with a short notice and a green check or “Copied” button state. Feedback resets after about two seconds without moving focus or changing button width. Empty content and clipboard errors show a localized failure notice; copied content is never included in the notice.
+
 ```powershell
 npm ci
 npm run lint

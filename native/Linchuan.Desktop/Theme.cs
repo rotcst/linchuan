@@ -69,7 +69,9 @@ public static class Theme
             ["Hover"] = "color-hover",
             ["TraySurface"] = "tray-menu-bg",
             ["TrayActive"] = "tray-menu-active-bg",
-            ["TrayActiveText"] = "tray-menu-active-text"
+            ["TrayActiveText"] = "tray-menu-active-text",
+            ["ToastSurface"] = "toast-bg",
+            ["ToastText"] = "toast-text"
         })
             resources[name] = new SolidColorBrush((Color)ColorConverter.ConvertFromString(Resolve(token)));
         resources["Font"] = new FontFamily(L.Language switch { "ko" => "Malgun Gothic", "ja" => "Yu Gothic UI", _ => "Microsoft YaHei UI" });

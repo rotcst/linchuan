@@ -63,8 +63,11 @@ public sealed class MainWindow : AppWindow
     public CancellationToken Lifetime => _lifetime.Token;
     public event Action? ExitRequested;
     internal event Action<string>? CopyCompleted;
+    internal Action<string> ClipboardWriter { get; set; } = Clipboard.SetText;
+    private CopyFeedback? _copyFeedback;
     private void Build()
     {
+        _copyFeedback?.Dispose(); _copyFeedback = new CopyFeedback(value => ClipboardWriter(value));
         Title = L.T("邻传") + " · " + L.T("设备互传");
         var root = new Grid(); root.SetResourceReference(Panel.BackgroundProperty, "Page");
         root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(56) }); root.RowDefinitions.Add(new RowDefinition());
@@ -106,6 +109,7 @@ public sealed class MainWindow : AppWindow
         var hint = Ui.Text("Enter 发送 · Shift + Enter 换行", 11, "Muted"); hint.HorizontalAlignment = HorizontalAlignment.Right; Grid.SetRow(hint, 1); Grid.SetColumnSpan(hint, 3); composer.Children.Add(hint); var composerFrame = Ui.Border(composer, "Surface", 0); composerFrame.Margin = new Thickness(16, 10, 16, 16); Grid.SetRow(composerFrame, 3); chat.Children.Add(composerFrame); Grid.SetColumn(chat, 1); Grid.SetRow(chat, 1); root.Children.Add(chat);
         var side = Ui.Border(new ScrollViewer { Content = BuildInspector(), VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled }, "Rail", 18, 0); Grid.SetRow(side, 1); Grid.SetColumn(side, 2); root.Children.Add(side);
         _error = Ui.Text("", 12, "Danger"); _error.Margin = new Thickness(18, 8, 18, 8); _error.Visibility = Visibility.Collapsed; Grid.SetRow(_error, 1); Grid.SetColumn(_error, 1); _error.VerticalAlignment = VerticalAlignment.Top; Panel.SetZIndex(_error, 4); root.Children.Add(_error);
+        Grid.SetRow(_copyFeedback.View, 2); Panel.SetZIndex(_copyFeedback.View, 5); chat.Children.Add(_copyFeedback.View);
         Content = root; RenderDevices(); UpdateHeading();
     }
     private StackPanel BuildInspector()
@@ -113,7 +117,7 @@ public sealed class MainWindow : AppWindow
         var panel = new StackPanel(); var title = Ui.Text("连接设备", 20); title.FontWeight = FontWeights.SemiBold; panel.Children.Add(title); var subtitle = Ui.Text("扫码或输入地址加入", 12, "Muted"); subtitle.Margin = new Thickness(0, 4, 0, 8); panel.Children.Add(subtitle);
         _hostStatus = Ui.Text(GetHostStatusText(), 12, "Muted"); AutomationProperties.SetAutomationId(_hostStatus, "HostStatus"); _hostStatus.Margin = new Thickness(0, 0, 0, 16); panel.Children.Add(_hostStatus);
         panel.Children.Add(Ui.Text("这台电脑的连接码", 12, "Muted")); _code = Ui.Text(_host?.Code ?? "— — —", 38); _code.FontFamily = new FontFamily("Cascadia Code"); _code.FontWeight = FontWeights.Bold; _code.Margin = new Thickness(0, 8, 0, 6); panel.Children.Add(_code);
-        panel.Children.Add(Ui.Row(Ui.Button("复制连接码", () => Copy(_host?.Code ?? ""), "CopyCode"), Ui.AsyncButton("刷新连接码", () => RunAsync(async () => { var client = Client!; var updated = await client.RefreshCodeAsync(Lifetime); if (Client != client) return; _host ??= updated; _host.Code = updated.Code; _host.JoinLocked = updated.JoinLocked; _code.Text = updated.Code; }), "RefreshCode")));
+        panel.Children.Add(Ui.Row(CreateCopyButton("复制连接码", () => _host?.Code ?? "", "CopyCode", "连接码已复制"), Ui.AsyncButton("刷新连接码", () => RunAsync(async () => { var client = Client!; var updated = await client.RefreshCodeAsync(Lifetime); if (Client != client) return; _host ??= updated; _host.Code = updated.Code; _host.JoinLocked = updated.JoinLocked; _code.Text = updated.Code; }), "RefreshCode")));
         _qr = new Image { Width = 144, Height = 144, Margin = new Thickness(0, 24, 0, 20), Stretch = Stretch.Uniform }; AutomationProperties.SetAutomationId(_qr, "ConnectionQr"); panel.Children.Add(_qr);
         var urls = (_host?.LocalUrl is { Length: > 0 } local ? [local] : Array.Empty<string>())
             .Concat(_info?.Urls ?? [])
@@ -125,7 +129,7 @@ public sealed class MainWindow : AppWindow
         if (_entry.Length == 0 && urls.Length > 0)
             _entry = urls.FirstOrDefault(url => !IsLoopbackUrl(url)) ?? Target;
         panel.Children.Add(Ui.Text("选择连接入口", 12, "Muted")); var menu = Ui.Menu(_entry, urls.Select(url => (url, (Action)(() => SelectConnectionEntry(url)))), "Entry"); _entryMenu = menu; menu.Margin = new Thickness(0, 6, 0, 8); panel.Children.Add(menu);
-        var address = Ui.Input(_entry, "Address"); _address = address; address.IsReadOnly = true; address.Height = 34; address.BorderThickness = new Thickness(0); var copy = Ui.Button("", () => Copy(_entry), "CopyAddress"); copy.Content = Ui.Icon("copy"); copy.Width = 34; copy.Padding = new Thickness(4); copy.BorderThickness = new Thickness(0); copy.ToolTip = L.T("复制地址"); var addressRow = new DockPanel(); DockPanel.SetDock(copy, Dock.Right); addressRow.Children.Add(copy); addressRow.Children.Add(address); var addressFrame = Ui.Border(addressRow, "Field", 0); addressFrame.Margin = new Thickness(0, 8, 0, 0); panel.Children.Add(addressFrame);
+        var address = Ui.Input(_entry, "Address"); _address = address; address.IsReadOnly = true; address.Height = 34; address.BorderThickness = new Thickness(0); var copy = CreateCopyButton("", () => _entry, "CopyAddress", "地址已复制"); copy.Content = Ui.Icon("copy"); copy.Width = 34; copy.Padding = new Thickness(4); copy.BorderThickness = new Thickness(0); copy.ToolTip = L.T("复制地址"); var addressRow = new DockPanel(); DockPanel.SetDock(copy, Dock.Right); addressRow.Children.Add(copy); addressRow.Children.Add(address); var addressFrame = Ui.Border(addressRow, "Field", 0); addressFrame.Margin = new Thickness(0, 8, 0, 0); panel.Children.Add(addressFrame);
         var instructions = Ui.Text("手机扫描二维码，电脑输入上面的地址。", 12, "Muted"); instructions.Margin = new Thickness(0, 16, 0, 4); panel.Children.Add(instructions); panel.Children.Add(Ui.Text("再输入服务电脑页面上的 6 位连接码。", 12, "Muted"));
         var persistent = Ui.Text("文件与聊天持久保存", 13); persistent.Margin = new Thickness(0, 26, 0, 5); panel.Children.Add(persistent); panel.Children.Add(Ui.Text("保存在服务电脑，重启后保留。", 12, "Muted")); panel.Children.Add(Ui.Text("删除聊天记录仅影响本设备。", 12, "Muted"));
         _transfer = Ui.Text("", 12, "Muted"); _transfer.Margin = new Thickness(0, 20, 0, 8); panel.Children.Add(_transfer); _cancel = Ui.Button("取消", () => _transferCancellation?.Cancel(), "CancelTransfer"); _cancel.Visibility = _busy ? Visibility.Visible : Visibility.Collapsed; panel.Children.Add(_cancel); return panel;
@@ -311,11 +315,19 @@ public sealed class MainWindow : AppWindow
     }
     private AppWindow Dialog(string title) => AppDialog.Create(title, this);
     public void ChangeAppearance(string? language, string? theme) { if (language is not null) _preferences.Language = language; if (theme is not null) _preferences.Theme = theme; L.Set(_preferences.Language); Theme.Apply(_preferences.Theme); _preferences.Save(_options.ClientDir); Build(); _ = RefreshQrAsync(); }
-    public void Copy(string value) { if (value.Length > 0) { Clipboard.SetText(value); CopyCompleted?.Invoke(value); } }
+    internal Button CreateCopyButton(string label, Func<string> value, string id, string successKey)
+    {
+        Button? button = null; button = Ui.Button(label, () => Copy(value(), button, successKey, label.Length == 0), id);
+        AutomationProperties.SetName(button, L.T(label.Length > 0 ? label : id == "CopyAddress" ? "复制地址" : "复制消息")); return button;
+    }
+    public void Copy(string value, Button? button = null, string successKey = "消息已复制", bool iconOnly = true)
+    {
+        if (_copyFeedback!.TryCopy(value, button, successKey, iconOnly)) CopyCompleted?.Invoke(value);
+    }
     public async Task RunAsync(Func<Task> action) { try { await action(); _error.Visibility = Visibility.Collapsed; } catch (OperationCanceledException) when (Lifetime.IsCancellationRequested) { } catch (Exception ex) { ShowError(ex); } }
     private void ShowError(Exception ex) { _error.Text = L.T(ex.Message); _error.Visibility = Visibility.Visible; }
     public void RequestExit() { _exit = true; ExitRequested?.Invoke(); }
-    public async Task ShutdownAsync() { _exit = true; _lifetime.Cancel(); if (Client is not null) await Client.DisposeAsync(); Close(); }
+    public async Task ShutdownAsync() { _exit = true; _lifetime.Cancel(); _copyFeedback?.Dispose(); if (Client is not null) await Client.DisposeAsync(); Close(); }
 }
 
 public sealed class MessageCard : Border
@@ -335,7 +347,7 @@ public sealed class MessageCard : Border
         }
         else card.Children.Add(Ui.Text(message.Text, 15));
         var actions = Ui.Row(); actions.HorizontalAlignment = HorizontalAlignment.Right; actions.Margin = new Thickness(0, 7, 0, 0);
-        if (message.File is not null) actions.Children.Add(Ui.AsyncButton("下载", () => owner.RunAsync(() => owner.SaveFileAsync(message.File)), "Download-" + message.Id)); else { var copy = Ui.Button("", () => owner.Copy(message.Text), "Copy-" + message.Id); copy.Content = Ui.Icon("copy"); copy.ToolTip = L.T("复制消息"); actions.Children.Add(copy); }
+        if (message.File is not null) actions.Children.Add(Ui.AsyncButton("下载", () => owner.RunAsync(() => owner.SaveFileAsync(message.File)), "Download-" + message.Id)); else { var copy = owner.CreateCopyButton("", () => message.Text, "Copy-" + message.Id, "消息已复制"); copy.Content = Ui.Icon("copy"); copy.ToolTip = L.T("复制消息"); actions.Children.Add(copy); }
         var delete = Ui.AsyncButton("", () => owner.RunAsync(() => owner.HideMessageAsync(message)), "Delete-" + message.Id); delete.Content = Ui.Icon("delete"); delete.ToolTip = L.T("仅从本设备删除"); actions.Children.Add(delete); foreach (var button in actions.Children.OfType<Button>()) { button.Height = 28; button.Padding = new Thickness(6, 3, 6, 3); button.BorderThickness = new Thickness(0); button.SetResourceReference(Control.BackgroundProperty, mine ? "Selected" : "Surface"); if (button.Content is TextBlock icon) { icon.FontSize = 14; icon.SetResourceReference(TextBlock.ForegroundProperty, "Muted"); } }
         card.Children.Add(actions); column.Children.Add(body);
         var menu = new ContextMenu(); if (message.File is not null) { var save = new MenuItem { Header = L.T("另存为…") }; save.Click += async (_, _) => await owner.RunAsync(() => owner.SaveFileAsync(message.File)); menu.Items.Add(save); } else { var copy = new MenuItem { Header = L.T("复制消息") }; copy.Click += (_, _) => owner.Copy(message.Text); menu.Items.Add(copy); }

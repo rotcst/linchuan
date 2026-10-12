@@ -97,8 +97,9 @@ internal static class NativeVerification
         Assert(Math.Abs(brandArrows.TranslatePoint(new Point(brandArrows.ActualWidth / 2, brandArrows.ActualHeight / 2), mark).X - mark.ActualWidth / 2) < 1 && Math.Abs(brandArrows.TranslatePoint(new Point(brandArrows.ActualWidth / 2, brandArrows.ActualHeight / 2), mark).Y - mark.ActualHeight / 2) < 1, "symmetric vector arrows centered"); checks.Add("Centered vector brand arrows / horizontal bottom-aligned title and subtitle");
         var copyButton = Find<Button>(window, "CopyAddress")!; var addressRow = (DockPanel)copyButton.Parent; Assert(Math.Abs(copyButton.TranslatePoint(new Point(copyButton.ActualWidth, 0), addressRow).X - addressRow.ActualWidth) < 1, "copy button dock right"); Assert(Find<TextBox>(window, "Address")!.TextAlignment == TextAlignment.Left, "address text left alignment"); checks.Add("12px dynamic toolbar gaps / left-aligned URL and right-docked copy");
         VerifyCopy(window, Find<Button>(window, "Copy-" + sent.Id)!, sent.Text);
-        VerifyCopy(window, Find<Button>(window, "CopyAddress")!, Find<TextBox>(window, "Address")!.Text);
-        VerifyCopy(window, Find<Button>(window, "CopyCode")!, (await native.HostAsync()).Code);
+        VerifyCopy(window, Find<Button>(window, "CopyAddress")!, Find<TextBox>(window, "Address")!.Text, "地址已复制");
+        VerifyCopy(window, Find<Button>(window, "CopyCode")!, (await native.HostAsync()).Code, "连接码已复制");
+        await VerifyCopyFeedbackAsync(window, sent, directory); checks.Add("Copy feedback: actual clipboard / all copy entries / four languages and themes / stable width and focus / rapid repeat and reset / empty and clipboard failure");
         await Task.Delay(300); GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect(); await Task.Delay(200);
         await File.WriteAllTextAsync(options.VerifyOutput!, JsonSerializer.Serialize(new { passed = true, checks, elapsedMs = watch.ElapsedMilliseconds, initialWorkingSetBytes, peakWorkingSetBytes, afterQaGcWorkingSetBytes = Process.GetCurrentProcess().WorkingSet64, nativeWpf = true, browserOrWebView = false, packagedProcess = NativeWindowCapture.IsPackagedProcess }, new JsonSerializerOptions { WriteIndented = true }));
     }
@@ -161,7 +162,16 @@ internal static class NativeVerification
         await WaitAsync(() => !menu.IsOpen && PresentationSource.FromVisual(menu) is null);
         await menu.Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.ContextIdle);
     }
-    private static void VerifyCopy(MainWindow window, Button button, string text)
+    private static void VerifyCopy(MainWindow window, Button button, string text, string successKey = "消息已复制")
+    {
+        var width = button.ActualWidth; var focused = System.Windows.Input.Keyboard.FocusedElement;
+        VerifyClipboardAction(window, () => button.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)), text);
+        window.UpdateLayout(); AssertCopyNotice(window, successKey);
+        Assert((button.Content is System.Windows.Shapes.Path || button.Content is TextBlock label && label.Text == L.T("已复制")) && ((SolidColorBrush)button.Background).Color == ((SolidColorBrush)Ui.Brush("Accent")).Color, "copy button has visible success state");
+        Assert(button.ToolTip as string == L.T("已复制") && AutomationProperties.GetName(button) == L.T("已复制"), "copy success tooltip and accessible name");
+        Assert(Math.Abs(button.ActualWidth - width) < 1 && System.Windows.Input.Keyboard.FocusedElement == focused, "copy feedback preserves button width and keyboard focus");
+    }
+    private static void VerifyClipboardAction(MainWindow window, Action action, string text)
     {
         var existing = Clipboard.GetDataObject(); var snapshot = new DataObject();
         if (existing is not null) foreach (var format in existing.GetFormats(false)) { var value = existing.GetData(format, false); if (value is not null) snapshot.SetData(format, value, false); }
@@ -169,8 +179,54 @@ internal static class NativeVerification
         void Completed(string value) { actionRan = true; actionMatched = value == text; writeSequence = NativeWindowCapture.GetClipboardSequenceNumber(); }
         window.CopyCompleted += Completed;
         // Validate the public Windows text format independently of WPF's data-object reader.
-        try { button.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); var copied = NativeWindowCapture.ReadClipboardUnicode(window, writeSequence); Assert(actionRan && actionMatched && copied == text && writeSequence == NativeWindowCapture.GetClipboardSequenceNumber(), $"native CF_UNICODETEXT; actionRan={actionRan}, actionMatched={actionMatched}, expectedLength={text.Length}, actualLength={copied.Length}, externalChange={writeSequence != NativeWindowCapture.GetClipboardSequenceNumber()}"); }
+        try { action(); var copied = NativeWindowCapture.ReadClipboardUnicode(window, writeSequence); Assert(actionRan && actionMatched && copied == text && writeSequence == NativeWindowCapture.GetClipboardSequenceNumber(), $"native CF_UNICODETEXT; actionRan={actionRan}, actionMatched={actionMatched}, expectedLength={text.Length}, actualLength={copied.Length}, externalChange={writeSequence != NativeWindowCapture.GetClipboardSequenceNumber()}"); }
         finally { window.CopyCompleted -= Completed; if (existing is null) Clipboard.Clear(); else Clipboard.SetDataObject(snapshot, true); }
+    }
+    private static void AssertCopyNotice(MainWindow window, string key)
+    {
+        var frame = Find<Border>(window, "CopyFeedback")!; var text = Find<TextBlock>(window, "CopyFeedbackText")!;
+        Assert(frame.Visibility == Visibility.Visible && text.Text == L.T(key), "localized copy notice visible");
+        window.UpdateLayout(); var composer = Find<TextBox>(window, "Composer")!;
+        Assert(frame.TranslatePoint(new Point(0, frame.ActualHeight), window).Y + 8 <= composer.TranslatePoint(new Point(), window).Y, "copy notice stays above the composer with a visible gap");
+        Assert(((SolidColorBrush)frame.Background).Color == ((SolidColorBrush)Ui.Brush("ToastSurface")).Color && ((SolidColorBrush)text.Foreground).Color == ((SolidColorBrush)Ui.Brush("ToastText")).Color, "copy notice uses shared theme tokens");
+        Assert(!frame.IsHitTestVisible && AutomationProperties.GetLiveSetting(text) == AutomationLiveSetting.Polite, "copy notice is nonblocking and accessible");
+    }
+    private static async Task VerifyCopyFeedbackAsync(MainWindow window, ChatMessage sent, string directory)
+    {
+        foreach (var language in new[] { "zh", "en", "ko", "ja" }) foreach (var theme in new[] { "light", "dark" })
+        {
+            window.ChangeAppearance(language, theme); window.UpdateLayout();
+            Assert(Find<Border>(window, "CopyFeedback")!.Visibility == Visibility.Collapsed, "appearance rebuild clears old copy feedback");
+            var composer = Find<TextBox>(window, "Composer")!; composer.Text = "Copy feedback keeps the draft\nand its second line\nand its third line"; composer.Focus();
+            VerifyCopy(window, Find<Button>(window, "Copy-" + sent.Id)!, sent.Text);
+            if (language == "zh") { await Task.Delay(60); Screenshot(window, Path.Combine(directory, "native-copy-message-" + theme + ".png")); }
+            VerifyCopy(window, Find<Button>(window, "CopyAddress")!, Find<TextBox>(window, "Address")!.Text, "地址已复制");
+            if (language == "zh") { await Task.Delay(60); Screenshot(window, Path.Combine(directory, "native-copy-address-" + theme + ".png")); }
+            var codeButton = Find<Button>(window, "CopyCode")!; var original = codeButton.Content;
+            VerifyCopy(window, codeButton, (await window.Client!.HostAsync()).Code, "连接码已复制");
+            Assert(composer.Text == "Copy feedback keeps the draft\nand its second line\nand its third line", "copy feedback keeps multiline composer draft");
+            if (language == "ja" && theme == "dark") { await WaitAsync(() => Find<Border>(window, "CopyFeedback")!.Visibility == Visibility.Collapsed); Assert(ReferenceEquals(codeButton.Content, original), "copy text button restores its original content"); }
+        }
+        window.ChangeAppearance("zh", "dark"); window.UpdateLayout();
+        var addressButton = Find<Button>(window, "CopyAddress")!; var originalIcon = addressButton.Content; var address = Find<TextBox>(window, "Address")!.Text;
+        // Cross the first copy's timeout while leaving a full second before the repeat expires.
+        VerifyCopy(window, addressButton, address, "地址已复制"); await Task.Delay(1200); VerifyCopy(window, addressButton, address, "地址已复制"); await Task.Delay(1000);
+        AssertCopyNotice(window, "地址已复制"); await WaitAsync(() => Find<Border>(window, "CopyFeedback")!.Visibility == Visibility.Collapsed); Assert(ReferenceEquals(addressButton.Content, originalIcon), "repeat copy resets timeout and restores icon");
+        var messageButton = Find<Button>(window, "Copy-" + sent.Id)!; DependencyObject? ancestor = messageButton;
+        while (ancestor is not null && ancestor is not MessageCard) ancestor = VisualTreeHelper.GetParent(ancestor);
+        var copyItem = ((MessageCard)ancestor!).ContextMenu!.Items.OfType<MenuItem>().Single(item => (string)item.Header == L.T("复制消息"));
+        VerifyClipboardAction(window, () => copyItem.RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent)), sent.Text); AssertCopyNotice(window, "消息已复制");
+        var writer = window.ClipboardWriter; var completed = 0; void Completed(string _) => completed++; window.CopyCompleted += Completed;
+        try
+        {
+            var sequence = NativeWindowCapture.GetClipboardSequenceNumber(); var writes = 0; window.ClipboardWriter = _ => writes++;
+            window.Copy("", addressButton); AssertCopyNotice(window, "没有可复制的内容。"); Assert(writes == 0 && completed == 0, "empty copy does not write or report success");
+            window.ClipboardWriter = _ => throw new System.Runtime.InteropServices.ExternalException("QA clipboard failure detail must not be displayed");
+            addressButton.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); AssertCopyNotice(window, "复制失败，剪贴板可能被其他程序占用，请重试。");
+            Assert(completed == 0 && NativeWindowCapture.GetClipboardSequenceNumber() == sequence && ReferenceEquals(addressButton.Content, originalIcon), "failed copy preserves clipboard and does not show success");
+            Screenshot(window, Path.Combine(directory, "native-copy-failure.png"));
+        }
+        finally { window.ClipboardWriter = writer; window.CopyCompleted -= Completed; window.ChangeAppearance("zh", "dark"); }
     }
     public static void Screenshot(Window window, string file) { window.UpdateLayout(); NativeWindowCapture.Save(window, file, ((AppWindow)window).CaptionResource); }
     private static async Task WaitAsync(Func<bool> condition) { var deadline = DateTime.UtcNow.AddSeconds(10); while (!condition()) { if (DateTime.UtcNow > deadline) throw new TimeoutException("Native QA condition timed out."); await Task.Delay(40); } }

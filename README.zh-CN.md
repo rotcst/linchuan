@@ -55,6 +55,8 @@ Cloudflare 1033 表示域名没有可用的通道连接，需确认服务电脑�
 
 ## 开发与检查
 
+Windows 客户端复制消息、地址或连接码后，会显示提示及绿色对勾或「已复制」按钮状态，约两秒后恢复，不改变按钮宽度或键盘焦点。空内容和剪贴板错误会显示本地化失败提示；提示不会包含被复制的内容。
+
 需要 Node.js 24.14.1 或更新版本；免安装版已内置运行时。前端 React + TypeScript + Vite，后端 Express + WebSocket + SQLite。源代码位于 src/server，测试位于 test。
 
 ```powershell
