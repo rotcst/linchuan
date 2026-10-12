@@ -196,7 +196,7 @@ public sealed class BackendHost : IAsyncDisposable
             using var response = await client.GetAsync($"http://127.0.0.1:{port}/api/info", ct); if (!response.IsSuccessStatusCode) return null;
             var info = await response.Content.ReadFromJsonAsync<ServerInfo>(cancellationToken: ct);
             if (info?.ServerName != "邻传") return null;
-            if (info.DesktopApi < 2) throw new InvalidOperationException("旧版服务仍在运行，请先退出旧版邻传，再启动桌面程序。数据会保留。");
+            if (info.DesktopApi < 3) throw new InvalidOperationException("旧版服务仍在运行，请先退出旧版邻传，再启动桌面程序。数据会保留。");
             if (!string.Equals(info.PublicUrl, configuredPublicUrl, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("现有服务的公网入口配置与当前桌面配置不一致，请先退出现有邻传服务，再启动桌面程序。数据会保留。");
             return true;

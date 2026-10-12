@@ -1,6 +1,6 @@
 {
   "name": "linchuan-lan",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -11,6 +11,7 @@
     "format:check": "prettier --check src server test scripts *.json *.ts *.js *.html",
     "test": "tsx --test test/*.test.ts",
     "test:browser": "tsx scripts/browser-check.ts",
+    "test:network-browser": "tsx scripts/network-browser-check.ts",
     "build": "npm run typecheck && vite build && esbuild server/index.ts --bundle --platform=node --format=cjs --external:sharp --legal-comments=linked --outfile=build/server.cjs",
     "start": "node build/server.cjs",
     "package": "node scripts/package.mjs"
@@ -19,6 +20,7 @@
     "node": ">=24.14.1"
   },
   "dependencies": {
+    "@peculiar/x509": "2.1.0",
     "@radix-ui/react-dropdown-menu": "^2.1.25",
     "busboy": "^1.6.0",
     "express": "^5.3.0",
@@ -31,6 +33,7 @@
     "react-dom": "^19.3.0",
     "react-i18next": "^17.0.16",
     "sharp": "^0.35.5",
+    "werift": "0.25.0",
     "ws": "^8.22.0",
     "yet-another-react-lightbox": "^3.32.2"
   },

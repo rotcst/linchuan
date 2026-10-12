@@ -19,6 +19,7 @@ public sealed class Device
     public DeviceType Type { get; set; }
     public bool Online { get; set; }
     public long? LastSeen { get; set; }
+    public string? CanHostVersion { get; set; }
 }
 
 public sealed class FileRef

@@ -7,8 +7,10 @@ public sealed class DesktopOptions
     private static readonly string Root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Linchuan");
     public string AppDir { get; set; } = Path.Combine(Root, "app");
     public string DataDir { get; set; } = Path.Combine(Root, "data");
+    public string StorageRoot { get; set; } = "";
     public string ClientDir { get; set; } = Path.Combine(Root, "desktop");
     public int Port { get; set; } = 3939;
+    public bool PortSpecified { get; set; }
     public bool LocalOnly { get; set; }
     public string? ServerUri { get; set; }
     public string? VerifyOutput { get; set; }
@@ -24,7 +26,7 @@ public sealed class DesktopOptions
                 case "--app-dir": options.AppDir = Path.GetFullPath(Value()); break;
                 case "--data-dir": options.DataDir = Path.GetFullPath(Value()); break;
                 case "--client-dir": options.ClientDir = Path.GetFullPath(Value()); break;
-                case "--port": options.Port = int.Parse(Value(), System.Globalization.CultureInfo.InvariantCulture); break;
+                case "--port": options.Port = int.Parse(Value(), System.Globalization.CultureInfo.InvariantCulture); options.PortSpecified = true; break;
                 case "--server":
                     var server = new Uri(Value(), UriKind.Absolute);
                     if (server.Scheme is not ("http" or "https") || server.UserInfo.Length > 0) throw new ArgumentException("HTTP or HTTPS address without credentials required.");
@@ -37,12 +39,16 @@ public sealed class DesktopOptions
         if (options.Port is < 1024 or > 65535) throw new ArgumentException("Port must be between 1024 and 65535.");
         if (options.ServerUri is not null && new Uri(options.ServerUri).Scheme is not ("http" or "https")) throw new ArgumentException("HTTP or HTTPS required.");
         ManagedPaths.Create(options.ClientDir);
+        options.StorageRoot = options.DataDir;
         return options;
     }
 }
 
 public sealed class Preferences
 {
+    public bool? Hosting { get; set; }
+    public string HostDataDir { get; set; } = "";
+    public int HostPort { get; set; } = 3939;
     public string Language { get; set; } = L.DefaultLanguage;
     public string Theme { get; set; } = "system";
     public string Server { get; set; } = "";

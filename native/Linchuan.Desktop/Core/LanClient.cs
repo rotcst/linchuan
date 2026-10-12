@@ -8,7 +8,7 @@ using System.Text.Json.Serialization;
 
 namespace Linchuan.Desktop.Core;
 
-public sealed class LanClient : IAsyncDisposable
+public sealed partial class LanClient : IAsyncDisposable
 {
     private const int ChunkBytes = 8 * 1024 * 1024;
     private const int MaxSocketMessageBytes = 4 * 1024 * 1024;
@@ -21,6 +21,8 @@ public sealed class LanClient : IAsyncDisposable
 
     private readonly HttpClient _http;
     private readonly Uri _baseUri;
+    private readonly NetworkRoutes _routes;
+    private Task? _routeMonitor;
     private readonly SemaphoreSlim _socketGate = new(1, 1);
     private ClientWebSocket? _socket;
     private CancellationTokenSource? _socketCts;
@@ -32,7 +34,9 @@ public sealed class LanClient : IAsyncDisposable
     public LanClient(Uri baseUri)
     {
         _baseUri = new Uri(baseUri.AbsoluteUri.TrimEnd('/') + "/", UriKind.Absolute);
-        _http = new HttpClient(new HttpClientHandler { UseCookies = true, AllowAutoRedirect = false })
+        _routes = new NetworkRoutes(_baseUri);
+        _routes.Changed += uri => RouteChanged?.Invoke(uri);
+        _http = new HttpClient(new HttpClientHandler { UseCookies = true, AllowAutoRedirect = false, ServerCertificateCustomValidationCallback = (request, certificate, _, errors) => NetworkRoutes.ValidateCertificate(request.RequestUri!, certificate, errors, Network) })
         {
             BaseAddress = _baseUri,
             Timeout = TimeSpan.FromMinutes(5),
@@ -46,6 +50,34 @@ public sealed class LanClient : IAsyncDisposable
     public event Action<ChatMessage>? MessageReceived;
     public event Action<string>? MessageHidden;
     public event Action<string>? ConnectionChanged;
+    public event Action<Uri>? RouteChanged;
+    public Uri ActiveUri => _routes.Active;
+    public GroupNetwork? Network => _routes.Group;
+    public event Action<GroupNetwork>? HostMoved;
+    public void UseNetwork(GroupNetwork network) => _routes.Pin(network);
+    public async Task RefreshNetworkAsync(CancellationToken ct = default)
+    {
+        if (_session is null) return;
+        try { _routes.Pin(await SendAsync<GroupNetwork>(HttpMethod.Get, "api/network", null, true, ct)); }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.NotFound) { return; } // Older hosts remain usable.
+        await _routes.SelectAsync(ct);
+        _routeMonitor ??= MonitorRoutesAsync(_lifetimeCts.Token);
+    }
+    private async Task MonitorRoutesAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(15), ct);
+                var previous = ActiveUri; await _routes.SelectAsync(ct);
+                if (previous != ActiveUri && _socket?.State == WebSocketState.Open) await ConnectSocketAsync(ct);
+                if (_session is not null) _routes.Pin(await SendAsync<GroupNetwork>(HttpMethod.Get, "api/network", null, true, ct));
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+            catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException or InvalidDataException or System.Security.Cryptography.CryptographicException) { }
+        }
+    }
 
     public Task<ServerInfo> InfoAsync(CancellationToken ct = default) =>
         SendAsync<ServerInfo>(HttpMethod.Get, "api/info", null, false, ct);
@@ -153,12 +185,14 @@ public sealed class LanClient : IAsyncDisposable
         try
         {
             ThrowIfDisposed();
+            await _routes.SelectAsync(linked.Token);
             await DisconnectSocketAsync();
             var socket = new ClientWebSocket();
+            socket.Options.RemoteCertificateValidationCallback = (_, certificate, _, errors) => { using var cert = certificate is null ? null : new System.Security.Cryptography.X509Certificates.X509Certificate2(certificate); return NetworkRoutes.ValidateCertificate(ActiveUri, cert, errors, Network); };
             socket.Options.SetRequestHeader("User-Agent", $"Linchuan/{UpdateChecker.CurrentVersion().ToString(3)}");
-            socket.Options.SetRequestHeader("Origin", _baseUri.GetLeftPart(UriPartial.Authority));
+            socket.Options.SetRequestHeader("Origin", ActiveUri.GetLeftPart(UriPartial.Authority));
             socket.Options.SetRequestHeader("Cookie", $"linchuan_session={_session.Token}");
-            var builder = new UriBuilder(_baseUri) { Scheme = _baseUri.Scheme == "https" ? "wss" : "ws", Path = "ws" };
+            var builder = new UriBuilder(ActiveUri) { Scheme = ActiveUri.Scheme == "https" ? "wss" : "ws", Path = "ws" };
             await socket.ConnectAsync(builder.Uri, linked.Token);
             if (Volatile.Read(ref _disposed) != 0) { socket.Abort(); socket.Dispose(); throw new ObjectDisposedException(nameof(LanClient)); }
             _socket = socket;
@@ -268,8 +302,10 @@ public sealed class LanClient : IAsyncDisposable
         _reconnectCts.Cancel();
         _lifetimeCts.Cancel();
         await DisconnectSocketAsync();
+        if (_routeMonitor is not null) try { await _routeMonitor; } catch (OperationCanceledException) { }
         _session = null;
         _http.Dispose();
+        _routes.Dispose();
     }
 
     private async Task ReceiveSocketAsync(ClientWebSocket socket, CancellationToken ct)
@@ -300,6 +336,12 @@ public sealed class LanClient : IAsyncDisposable
                     MessageReceived?.Invoke(JsonSerializer.Deserialize<ChatMessage>(messageElement, JsonOptions) ?? new());
                 else if (type == "message-deleted" && root.TryGetProperty("id", out var id))
                     MessageHidden?.Invoke(id.GetString() ?? string.Empty);
+                else if (type == "handoff" && root.TryGetProperty("network", out var network))
+                {
+                    var changed = JsonSerializer.Deserialize<GroupNetwork>(network, JsonOptions) ?? throw new InvalidDataException("设备组信息无效。");
+                    _routes.Pin(changed); HostMoved?.Invoke(changed);
+                    socket.Abort();
+                }
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
@@ -369,10 +411,19 @@ public sealed class LanClient : IAsyncDisposable
 
     private async Task<HttpResponseMessage> SendResponseAsync(HttpMethod method, string path, HttpContent? content, bool auth, CancellationToken ct, bool hostOnly = false, bool responseHeadersOnly = false)
     {
-        using var request = new HttpRequestMessage(method, path) { Content = content };
+        if (_routes.Group is not null && !hostOnly && _socket?.State != WebSocketState.Open) await _routes.SelectAsync(ct);
+        using var request = new HttpRequestMessage(method, new Uri(hostOnly ? _baseUri : ActiveUri, path)) { Content = content };
         if (auth && !string.IsNullOrEmpty(_session?.Token)) request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _session.Token);
         if (hostOnly) request.Headers.TryAddWithoutValidation("X-Linchuan-Host", "1");
-        var response = await _http.SendAsync(request, responseHeadersOnly ? HttpCompletionOption.ResponseHeadersRead : HttpCompletionOption.ResponseContentRead, ct);
+        HttpResponseMessage response;
+        try { response = await _http.SendAsync(request, responseHeadersOnly ? HttpCompletionOption.ResponseHeadersRead : HttpCompletionOption.ResponseContentRead, ct); }
+        catch (HttpRequestException) when (!hostOnly && _routes.Group is not null && method == HttpMethod.Get)
+        {
+            await _routes.SelectAsync(ct);
+            using var retry = new HttpRequestMessage(method, new Uri(ActiveUri, path));
+            if (auth && !string.IsNullOrEmpty(_session?.Token)) retry.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _session.Token);
+            response = await _http.SendAsync(retry, responseHeadersOnly ? HttpCompletionOption.ResponseHeadersRead : HttpCompletionOption.ResponseContentRead, ct);
+        }
         if (!response.IsSuccessStatusCode)
         {
             var detail = await response.Content.ReadAsStringAsync(ct);

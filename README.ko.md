@@ -1,5 +1,15 @@
 # Linchuan
 
+## 1.2.0 자동 경로 선택 및 전체 서버 이전
+
+각 기기는 처음에 연결 코드 또는 QR 코드로 가입합니다. Windows는 그룹 공개 키로 확인한 LAN TLS 연결을 우선 사용합니다. 그룹의 HTTPS 주소로 연 휴대폰 페이지는 같은 LAN에서 WebRTC 암호화 직접 연결을 시도하고, 외출하면 HTTPS/WSS를 사용합니다. 집에 돌아오면 15초마다 직접 연결을 다시 시도합니다. 브라우저나 네트워크가 직접 연결을 차단하면 HTTPS를 유지하며 브라우저 보안을 해제하거나 평문으로 자동 전환하지 않습니다. 최초 페이지 열기와 시그널링에는 접속 가능한 서버가 필요합니다.
+
+LAN 페이지에서 인터넷 터널이 연결되어 있으면 단기 일회용 티켓으로 기기 ID를 HTTPS 주소에 이어 줍니다. 외출할 때 같은 주소를 사용하십시오. 집의 서버 PC는 계속 실행되고 인터넷에 연결되어 있어야 합니다.
+
+서버 PC의 온라인 기기 목록에서 다른 Windows PC를 우클릭하고 **서버 역할 이전**을 선택합니다. 두 PC는 같은 LAN에서 1.2.0 이상을 실행해야 합니다. 쓰기를 일시 중지하고 채팅, 파일, 기기 ID 및 터널을 복사하여 SHA-256을 확인한 뒤 새 서버로 전환합니다. 터널 자격 증명은 대상 PC용으로 암호화되어 전송되고 현재 사용자의 DPAPI로 다시 보호됩니다. 이전 서버는 일반 클라이언트로 바뀝니다. 커밋 전 중단은 만료될 수 있으며, 커밋 후에는 이전 서버의 쓰기를 막고 재시작 후 저장된 상태에서 복구합니다. 가져온 데이터는 `data/groups`의 별도 세대 폴더에 보관되고 이전 데이터는 유지됩니다.
+
+1.1.x에서 업그레이드한 후 LAN 연결이 차단되면 `%LOCALAPPDATA%\Linchuan\app\允许局域网访问.cmd`를 다시 실행하십시오. 번들 Node 프로그램과 로컬 서브넷에만 TCP 3939/3940 및 UDP 3941–3972를 허용합니다. 공유기 포트 포워딩은 필요 없습니다. 사용자 지정 `--port`에는 HTTP, TLS(port+1) 및 ICE UDP 범위에 맞는 규칙이 필요하며 스크립트는 기본 포트를 처리합니다.
+
 Linchuan은 가정용 LAN 또는 선택 사항인 HTTPS Cloudflare Tunnel을 통해 Windows PC와 휴대폰을 연결합니다. Windows에서는 브라우저나 WebView를 사용하지 않는 C# WPF 네이티브 앱을 실행하고, 휴대폰에서는 웹 인터페이스를 사용합니다. 온라인 기기, 공용·개인 채팅, 파일 보관 및 미디어 미리보기를 함께 제공합니다.
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Windows 다운로드](https://github.com/rotcst/linchuan/releases) · [보안](SECURITY.md) · [디자인 시스템](design/设计说明.md)
@@ -9,7 +19,7 @@ Linchuan은 가정용 LAN 또는 선택 사항인 HTTPS Cloudflare Tunnel을 통
 1. Windows 10/11 x64 컴퓨터 한 대에서 Releases의 **Linchuan.exe**를 내려받아 두 번 클릭합니다. 터미널이나 별도의 Node.js 설치는 필요하지 않습니다.
 2. 앱은 `%LOCALAPPDATA%\Linchuan\app`에 내장 프로그램 파일을 준비하고 `%LOCALAPPDATA%\Linchuan\data`에 서비스 데이터를 보관합니다. 창을 닫으면 트레이로 숨겨진 채 연결을 유지합니다. 트레이 또는 창의 **Linchuan 종료**는 이 인스턴스가 시작한 서비스만 중지합니다. EXE를 다시 실행하면 기존 창을 활성화합니다.
 3. 다른 Windows 컴퓨터에서도 같은 EXE를 실행한 뒤 초기 연결 창에서 첫 번째 컴퓨터의 주소와 연결 코드를 입력합니다. 휴대폰은 오른쪽 연결 패널의 QR 코드를 스캔하거나 LAN/HTTPS 주소를 열고 코드를 입력합니다. 웹페이지만으로 중지된 호스트를 시작할 수는 없습니다.
-4. Windows 방화벽이 LAN 연결을 차단하면 `%LOCALAPPDATA%\Linchuan\app\允许局域网访问.cmd`를 실행하고 관리자 확인을 승인합니다. 이 작업은 TCP 3939의 로컬 서브넷 접근만 허용합니다.
+4. Windows 방화벽이 LAN 연결을 차단하면 `%LOCALAPPDATA%\Linchuan\app\允许局域网访问.cmd`를 실행하고 관리자 확인을 승인합니다. 이 작업은 TCP 3939/3940 및 UDP 3941–3972의 로컬 서브넷 접근만 허용합니다.
 
 단일 EXE에는 .NET 런타임, Node.js 백엔드 및 Cloudflare 런타임이 포함됩니다. 첫 실행 시 관리되는 파일을 추출하며 업데이트해도 서비스 데이터는 보존됩니다. 네이티브 세션 토큰은 현재 Windows 사용자용 DPAPI로 `%LOCALAPPDATA%\Linchuan\desktop`에 보호됩니다. 서명되지 않은 앱 경고가 표시될 수 있으므로 Releases에 게시된 SHA-256을 확인하십시오.
 
@@ -39,9 +49,9 @@ Release의 SHA-256을 확인한 뒤 **Linchuan 종료**를 선택하고 새 EXE�
 
 `%LOCALAPPDATA%\Linchuan\data\linchuan.sqlite`에는 채팅·기기·파일 인덱스가 저장되고, 파일 본문은 `uploads`, 생성된 미리보기는 `previews`에 저장됩니다. 데이터는 기본적으로 유지되며 디스크 수준 암호화는 적용되지 않습니다. 한 기기에서 메시지를 숨겨도 원본 파일이나 다른 기기의 기록을 삭제하지 않습니다.
 
-백업하려면 먼저 서비스 컴퓨터에서 **Linchuan 종료**를 선택한 뒤 `data` 전체를 백업하십시오. 다른 사용자나 컴퓨터로 Tunnel을 옮기면 현재 Windows 사용자에 묶인 DPAPI 자격 증명을 다시 구성해야 합니다. `data` 폴더에는 채팅, 파일 및 Tunnel 자격 증명이 포함될 수 있으므로 공개하거나 전송하지 마십시오.
+백업하려면 먼저 서비스 컴퓨터에서 **Linchuan 종료**를 선택한 뒤 `data` 전체를 백업하십시오. DPAPI 자격 증명은 다른 사용자나 PC로 수동 복사할 수 없습니다. 전체 서버 이전을 사용하면 대상 사용자용으로 다시 보호됩니다. 수동 이전 시 재설정이 필요합니다. `data` 폴더에는 채팅, 파일 및 Tunnel 자격 증명이 포함될 수 있으므로 공개하거나 전송하지 마십시오.
 
-LAN 트래픽은 HTTP이고 인터넷 모드는 구성한 호스트 이름의 HTTPS를 사용합니다. 종단 간 암호화는 제공하지 않습니다. 6자리 연결 코드와 요청 속도 제한은 편의 기능이며 신뢰할 수 있는 사용자, 방화벽 및 HTTPS를 대신하지 않습니다.
+최초 LAN 페이지와 명시적 HTTP 가입은 HTTP입니다. 자동 Windows LAN 경로는 그룹 키로 확인한 TLS, 휴대폰 직접 연결은 WebRTC DTLS, 인터넷은 HTTPS/WSS를 사용합니다. 종단 간 암호화는 제공하지 않습니다. 6자리 연결 코드와 요청 속도 제한은 편의 기능이며 신뢰할 수 있는 사용자, 방화벽 및 HTTPS를 대신하지 않습니다.
 
 소스/폴더 실행은 프로젝트 또는 패키지의 `data`를 사용하고 EXE는 위의 AppData 경로를 사용합니다. 이전 웹 호스트를 옮길 때는 `cloudflare.json`과 `tunnel-token.dpapi`를 실제 EXE 데이터 디렉터리에 함께 두고 같은 Windows 사용자로 유지하십시오. 패키지 개발 도구는 AppData 접근을 리디렉션할 수 있으므로 파일 탐색기에서 앱과 설정을 실행해 실제 경로를 확인하십시오. 기존 채팅 데이터베이스를 덮어쓰지 마십시오.
 
@@ -54,7 +64,7 @@ LAN 트래픽은 HTTP이고 인터넷 모드는 구성한 호스트 이름의 HT
 ## 문제 해결
 
 - 연결되지 않으면 두 기기가 같은 비게스트 Wi-Fi에 있고 AP 격리가 꺼져 있는지 확인합니다.
-- 관리자 권한으로 `允许局域网访问.cmd`를 실행해 TCP 3939와 로컬 서브넷 방화벽 규칙을 만듭니다.
+- 관리자 권한으로 `允许局域网访问.cmd`를 실행해 프로그램별 로컬 서브넷 TCP/UDP 방화벽 규칙을 만듭니다.
 - VPN 또는 가상 어댑터가 있으면 가정용 라우터에 연결된 LAN 주소를 선택합니다.
 - 네이티브 호스트 창에서 인터넷 상태를 확인합니다. 다른 기기가 연결하려면 호스트가 실행 중이고 온라인 상태이며 절전 중이 아니어야 합니다.
 - Cloudflare 1033은 정상 Tunnel 커넥터가 없다는 뜻입니다. 페이지는 열리지만 네이티브 클라이언트에 HTTP 403 또는 브라우저 챌린지가 표시되면 전용 호스트의 `/api/`와 `/ws`에 브라우저 전용 챌린지 규칙이 적용되었는지 확인하십시오. 네이티브 클라이언트는 자신을 `Linchuan/<version>`으로 식별하지만 JavaScript 챌린지를 수행할 수 없습니다. 조정 범위는 해당 서비스 호스트와 엔드포인트로 제한하고 앱 인증 및 속도 제한은 유지하십시오.
@@ -73,6 +83,7 @@ npm audit --audit-level=moderate
 npm run build
 npx playwright install chromium
 npm run test:browser
+npm run test:network-browser
 npx tsx scripts/language-check.ts
 npx tsx scripts/visual-check.ts
 node scripts/fetch-runtime.mjs

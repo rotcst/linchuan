@@ -27,6 +27,7 @@ jobs:
       - run: npm run build
       - run: npx playwright install chromium
       - run: npm run test:browser
+      - run: npx tsx scripts/network-browser-check.ts
       - run: npx tsx scripts/language-check.ts
       - run: npx tsx scripts/visual-check.ts
       - run: node scripts/fetch-runtime.mjs

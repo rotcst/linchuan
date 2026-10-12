@@ -14,6 +14,7 @@ public sealed class DesktopSettings
     public int Port { get; set; } = 3939;
     public string AppDir { get; set; } = string.Empty;
     public string DataDir { get; set; } = string.Empty;
+    public GroupNetwork? Network { get; set; }
     [JsonIgnore] public string? SessionToken { get; set; }
     [JsonPropertyName("protectedToken")] public string? ProtectedToken { get; set; }
 }
@@ -73,6 +74,7 @@ public sealed class SettingsStore
             Port = settings.Port,
             AppDir = settings.AppDir,
             DataDir = settings.DataDir,
+            Network = settings.Network,
             ProtectedToken = Protect(settings.SessionToken),
         };
         root.Entries[MakeKey(settings.ServerUri, settings.DeviceId)] = copy;

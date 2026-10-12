@@ -18,6 +18,7 @@ import { HttpError } from './errors.js';
 import { mountTransfers } from './transfers.js';
 import { Storage } from './storage.js';
 import { mountMedia } from './media.js';
+import { createSecureLan, securePortFor } from './secure-lan.js';
 
 export type DeviceType = 'computer' | 'phone' | 'tablet';
 export type Device = {
@@ -52,6 +53,7 @@ export type LanServerOptions = {
   publicUrl?: string;
   hostStatus?: () => { internet: string };
   onStop?: () => void;
+  handoffTtlMs?: number;
 };
 type Session = { token: string; deviceId: string; expiresAt: number };
 type StoredFile = {
@@ -63,6 +65,30 @@ type StoredFile = {
 };
 type Orphan = { path: string; size: number; createdAt: number };
 const token = (bytes = 32) => crypto.randomBytes(bytes).toString('base64url');
+const normalizePrivateLanUrl = (value: string, port: number) => {
+  try {
+    const url = new URL(value);
+    const octets = url.hostname.split('.').map(Number);
+    const privateIp =
+      url.protocol === 'http:' &&
+      url.pathname === '/' &&
+      !url.username &&
+      !url.password &&
+      !url.search &&
+      !url.hash &&
+      url.port === String(port) &&
+      octets.length === 4 &&
+      octets.every(
+        (part) => Number.isInteger(part) && part >= 0 && part <= 255,
+      ) &&
+      (octets[0] === 10 ||
+        (octets[0] === 192 && octets[1] === 168) ||
+        (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31));
+    return privateIp ? url.origin + '/' : null;
+  } catch {
+    return null;
+  }
+};
 const safeName = (name: string) =>
   name
     .replace(/[\\/\0\r\n]/g, '_')
@@ -80,6 +106,7 @@ export function createLanServer(options: LanServerOptions) {
   const maxFileBytes = options.maxFileBytes ?? Number.MAX_SAFE_INTEGER;
   const maxStorageBytes = options.maxStorageBytes ?? Number.MAX_SAFE_INTEGER;
   const jsonBodyTimeoutMs = options.jsonBodyTimeoutMs ?? 15000;
+  const handoffTtlMs = options.handoffTtlMs ?? 10 * 60 * 1000;
   const diskStatfs =
     options.diskStatfs ?? (() => fsp.statfs(uploadDir, { bigint: true }));
   const publicUrl = options.publicUrl
@@ -99,6 +126,42 @@ export function createLanServer(options: LanServerOptions) {
   if (fs.lstatSync(uploadDir).isSymbolicLink())
     throw new Error('上传目录不能是符号链接。');
   const storage = new Storage(options.dataDir);
+  const networkIdentity = storage.loadOrCreateNetworkIdentity();
+  const removeHandoffStaging = (handoffId: string) => {
+    if (!/^[A-Za-z0-9_-]+$/.test(handoffId))
+      throw new Error('移交临时目录标识无效。');
+    const dataRoot = path.resolve(options.dataDir);
+    const root = path.join(dataRoot, `.handoff-${handoffId}`);
+    const rootParent = path.dirname(root);
+    const parentStat = fs.lstatSync(rootParent);
+    if (!parentStat.isDirectory() || parentStat.isSymbolicLink())
+      throw new Error('移交临时目录父目录无效。');
+    if (!fs.existsSync(root)) return;
+    const pending = [root];
+    while (pending.length) {
+      const current = pending.pop()!;
+      const stat = fs.lstatSync(current);
+      if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile()))
+        throw new Error('移交临时目录包含不安全文件。');
+      if (stat.isDirectory())
+        for (const child of fs.readdirSync(current))
+          pending.push(path.join(current, child));
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  };
+  const retiredAtStartup = storage.getMetadata('host.retired') === '1';
+  const activatedAtStartup = storage.getMetadata('handoff.activated') === '1';
+  if (!retiredAtStartup || activatedAtStartup) {
+    storage.deleteHandoffBrowserTicketsAfter(networkIdentity.hostGeneration);
+    for (const name of fs.readdirSync(options.dataDir)) {
+      if (!/^\.handoff-[A-Za-z0-9_-]+$/.test(name)) continue;
+      try {
+        removeHandoffStaging(name.slice('.handoff-'.length));
+      } catch {
+        // Never delete a staging tree that contains a reparse or special node.
+      }
+    }
+  }
   const maxJoinFailures = 20;
   const devices = new Map<string, Device>();
   const sessions = new Map<string, Session>();
@@ -110,6 +173,121 @@ export function createLanServer(options: LanServerOptions) {
   const activeUploads = new Map<string, () => void>();
   const joinAttempts = new Map<string, { count: number; at: number }>();
   const messageAttempts = new Map<string, { count: number; at: number }>();
+  const networkProbeAttempts = new Map<string, { count: number; at: number }>();
+  const capabilities = new Map<
+    string,
+    {
+      publicKey: string;
+      version: string;
+      receivePort: number;
+      lanUrls: string[];
+      updatedAt: number;
+    }
+  >();
+  const socketTickets = new Map<
+    string,
+    { session: Session; expiresAt: number }
+  >();
+  const browserTickets = new Map<
+    string,
+    { session: Session; expiresAt: number }
+  >();
+  let secureLan: ReturnType<typeof createSecureLan> | null = null;
+  type Handoff = {
+    id: string;
+    targetDeviceId: string;
+    generation: number;
+    targetPublicKey: string;
+    receivePort: number;
+    startedAt: number;
+    expiresAt: number;
+    frozen: boolean;
+    committed: boolean;
+    activated: boolean;
+    ready: boolean;
+    snapshotPath?: string;
+    chunksPath?: string;
+    files?: Array<{
+      index: number;
+      path: string;
+      size: number;
+      sha256: string;
+      source: string;
+    }>;
+    chunkBytes: number;
+    nextChunk: number;
+    chunkQuota: number;
+    activeChunkRequests: number;
+    redirectUrls?: string[];
+    browserTickets?: Array<{
+      sessionHash: string;
+      deviceId: string;
+      value: string;
+    }>;
+    offer?: {
+      envelope: string;
+      envelopeJson: string;
+      totalChunks: number;
+      totalBytes: number;
+      sha256: string;
+      signature: string;
+    };
+  };
+  let handoff: Handoff | null = null;
+  let handoffTimer: ReturnType<typeof setTimeout> | undefined;
+  const retired = () => storage.getMetadata('host.retired') === '1';
+  const scheduleHandoffExpiry = (candidate: Handoff) => {
+    clearTimeout(handoffTimer);
+    const delay = Math.max(50, candidate.expiresAt - Date.now() + 50);
+    handoffTimer = setTimeout(() => {
+      if (handoff !== candidate || candidate.committed) return;
+      if (candidate.activeChunkRequests > 0) {
+        candidate.expiresAt = Date.now() + handoffTtlMs;
+        scheduleHandoffExpiry(candidate);
+        return;
+      }
+      if (candidate.expiresAt > Date.now()) {
+        scheduleHandoffExpiry(candidate);
+        return;
+      }
+      try {
+        if (candidate.snapshotPath) removeHandoffStaging(candidate.id);
+      } catch {
+        // Never recursively delete a staging tree that failed safety checks.
+      }
+      storage.deleteHandoffBrowserTickets(candidate.generation);
+      handoff = null;
+    }, delay);
+    handoffTimer.unref?.();
+  };
+  const renewHandoff = (candidate = handoff) => {
+    if (
+      candidate &&
+      handoff === candidate &&
+      !candidate.committed &&
+      candidate.expiresAt > Date.now()
+    ) {
+      candidate.expiresAt = Date.now() + handoffTtlMs;
+      scheduleHandoffExpiry(candidate);
+    }
+  };
+  const committedMetadata = () => {
+    const id = storage.getMetadata('handoff.id');
+    if (!id) return null;
+    let urls: string[] = [];
+    try {
+      urls = JSON.parse(storage.getMetadata('handoff.urls') ?? '[]');
+    } catch {
+      /* invalid metadata is empty */
+    }
+    return {
+      id,
+      generation: Number(storage.getMetadata('handoff.generation') ?? 0),
+      targetDeviceId: storage.getMetadata('handoff.targetDeviceId') ?? '',
+      activated: storage.getMetadata('handoff.activated') === '1',
+      urls,
+    };
+  };
   let storedBytes = 0;
   for (const device of storage.loadDevices()) devices.set(device.id, device);
   for (const session of storage.loadSessions())
@@ -160,10 +338,18 @@ export function createLanServer(options: LanServerOptions) {
       if (request.headers.origin) {
         const origin = new URL(request.headers.origin);
         if (
-          origin.host !== hostValue ||
+          origin.host !== hostValue &&
+          !isConfiguredPublicCrossOrigin(request)
+        )
+          return false;
+        if (
+          origin.host === hostValue &&
           (hostname === (publicUrl ? new URL(publicUrl).hostname : null)
             ? origin.origin !== publicUrl
-            : origin.protocol !== 'http:')
+            : origin.protocol !== 'http:' &&
+              !secureLan
+                ?.urls()
+                .some((url) => new URL(url).origin === origin.origin))
         )
           return false;
       }
@@ -200,6 +386,47 @@ export function createLanServer(options: LanServerOptions) {
     ];
     return urls.length ? urls : [`http://127.0.0.1:${boundPort()}`];
   };
+  const lanUrls = () =>
+    ownUrls().filter((url) => {
+      try {
+        return !['localhost', '127.0.0.1', '::1'].includes(
+          new URL(url).hostname,
+        );
+      } catch {
+        return false;
+      }
+    });
+  const crossOriginPaths = (pathname: string) =>
+    pathname === '/ws' ||
+    pathname === '/api/info' ||
+    pathname === '/api/session' ||
+    pathname === '/api/device' ||
+    pathname === '/api/logout' ||
+    pathname.startsWith('/api/network') ||
+    pathname.startsWith('/api/messages') ||
+    pathname.startsWith('/api/transfers') ||
+    pathname.startsWith('/api/media');
+  const isConfiguredPublicCrossOrigin = (request: http.IncomingMessage) => {
+    if (
+      !publicUrl ||
+      !request.headers.origin ||
+      !crossOriginPaths(request.url?.split('?')[0] ?? '')
+    )
+      return false;
+    try {
+      const origin = new URL(request.headers.origin);
+      const hostValue = request.headers.host;
+      return (
+        origin.origin === publicUrl &&
+        !!hostValue &&
+        ownHosts().has(
+          new URL(`http://${hostValue}`).hostname.replace(/^\[|\]$/g, ''),
+        )
+      );
+    } catch {
+      return false;
+    }
+  };
   const hashToken = (value: string) =>
     crypto.createHash('sha256').update(value).digest('hex');
   const resolveSession = (value: string) => {
@@ -218,10 +445,16 @@ export function createLanServer(options: LanServerOptions) {
   const cookieFor = (session: Session, request: Request) =>
     `linchuan_session=${session.token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${Math.max(1, Math.floor((session.expiresAt - Date.now()) / 1000))}${secureCookie(request)}`;
   const publicDevices = () =>
-    [...devices.values()].map((device) => ({ ...device }));
+    [...devices.values()].map((device) => ({
+      ...device,
+      ...(capabilities.get(device.id)
+        ? { canHostVersion: capabilities.get(device.id)!.version }
+        : {}),
+    }));
   const forgetEmptyDevice = (id: string) => {
     if (
       sockets.get(id)?.size ||
+      secureLan?.hasDevice(id) ||
       [...sessions.values()].some((session) => session.deviceId === id)
     )
       return;
@@ -248,13 +481,16 @@ export function createLanServer(options: LanServerOptions) {
     });
     for (const group of sockets.values())
       for (const socket of group) sendSocket(socket, payload);
+    secureLan?.emit(null, payload);
   };
   const deliver = (message: Message) => {
     const recipients =
-      message.to === 'all' ? [...sockets.keys()] : [message.from, message.to];
+      message.to === 'all' ? [...devices.keys()] : [message.from, message.to];
     const payload = JSON.stringify({ type: 'message', message });
-    for (const id of new Set(recipients))
+    for (const id of new Set(recipients)) {
       for (const socket of sockets.get(id) ?? []) sendSocket(socket, payload);
+      secureLan?.emit(id, payload);
+    }
   };
   const remember = (message: Message) => {
     storage.saveMessage(
@@ -387,8 +623,42 @@ export function createLanServer(options: LanServerOptions) {
     response.setHeader('X-Frame-Options', 'DENY');
     response.setHeader(
       'Content-Security-Policy',
-      `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ws://${request.headers.host} wss://${request.headers.host}; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`,
+      `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ${[...ownUrls().map((value) => value.replace(/^http:/, 'ws:')), ...(publicUrl ? [publicUrl.replace(/^https:/, 'wss:')] : [])].join(' ')}; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`,
     );
+    if (isConfiguredPublicCrossOrigin(request)) {
+      response.setHeader('Access-Control-Allow-Origin', publicUrl!);
+      response.setHeader(
+        'Access-Control-Allow-Methods',
+        'GET,POST,PUT,DELETE,OPTIONS',
+      );
+      response.setHeader(
+        'Access-Control-Allow-Headers',
+        'Authorization,Content-Type',
+      );
+      response.setHeader('Access-Control-Allow-Credentials', 'false');
+      response.setHeader('Vary', 'Origin');
+      if (request.method === 'OPTIONS') {
+        const method = request.headers['access-control-request-method'];
+        const requested = (
+          request.headers['access-control-request-headers'] ?? ''
+        )
+          .split(',')
+          .map((value) => value.trim().toLowerCase())
+          .filter(Boolean);
+        if (
+          method &&
+          !['GET', 'POST', 'PUT', 'DELETE'].includes(method.toUpperCase())
+        )
+          return response.status(405).end();
+        if (
+          requested.some(
+            (value) => !['authorization', 'content-type'].includes(value),
+          )
+        )
+          return response.status(403).end();
+        return response.status(204).end();
+      }
+    }
     if (request.path.startsWith('/api'))
       response.setHeader('Cache-Control', 'no-store');
     next();
@@ -419,7 +689,39 @@ export function createLanServer(options: LanServerOptions) {
         .status(401)
         .json({ error: '连接已过期，请重新输入连接码。' });
     (request as Request & { session: Session }).session = session;
+    if (handoff && handoff.expiresAt <= Date.now() && !handoff.committed) {
+      if (handoff.snapshotPath) {
+        try {
+          fs.rmSync(path.dirname(handoff.snapshotPath), {
+            recursive: true,
+            force: true,
+          });
+        } catch {
+          /* best effort cleanup */
+        }
+      }
+      storage.deleteHandoffBrowserTickets(handoff.generation);
+      handoff = null;
+    }
+    const writeDuringHandoff =
+      ['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method) &&
+      ![
+        '/api/session',
+        '/api/network/socket-ticket',
+        '/api/network/browser-ticket',
+        '/api/network/browser-restore',
+        '/api/handoff/ready',
+        '/api/handoff/activated',
+      ].includes(request.path);
+    const frozenOrRetired = handoff?.frozen || retired();
+    if (frozenOrRetired && writeDuringHandoff)
+      return response.status(409).json({
+        error: retired()
+          ? '此服务已完成主机移交，请使用新的服务入口。'
+          : '主机移交进行中，暂时不能修改组数据。',
+      });
     if (
+      !frozenOrRetired &&
       options.expiryMs === undefined &&
       session.expiresAt - Date.now() < 15 * 24 * 3600000
     ) {
@@ -457,6 +759,79 @@ export function createLanServer(options: LanServerOptions) {
     if (++attempt.count > limit)
       throw new HttpError(429, '操作太频繁，请一分钟后再试。');
   };
+  const handleUpgrade = (
+    request: http.IncomingMessage,
+    socket: import('node:stream').Duplex,
+    head: Buffer,
+  ) => {
+    // A client may close the TLS/HTTP socket before the upgrade decision
+    // completes.  Keep that transport error from becoming an uncaught event.
+    socket.on('error', () => {});
+    try {
+      if (!validateOrigin(request) || closing) throw new Error();
+      const url = new URL(request.url ?? '', `http://${request.headers.host}`);
+      const queryToken = url.searchParams.get('token') ?? '';
+      const socketTicket = url.searchParams.get('ticket') ?? '';
+      const cookieToken = request.headers.cookie?.match(
+        /(?:^|;\s*)linchuan_session=([^;]+)/,
+      )?.[1];
+      let session = resolveSession(queryToken || cookieToken || '');
+      if (!queryToken && !cookieToken && socketTicket) {
+        const record = socketTickets.get(socketTicket);
+        socketTickets.delete(socketTicket);
+        if (
+          record &&
+          record.expiresAt > Date.now() &&
+          sessionValid(record.session)
+        )
+          session = record.session;
+      }
+      if (url.pathname !== '/ws' || !session || !sessionValid(session))
+        throw new Error();
+      wss.handleUpgrade(request, socket, head, (connection) =>
+        wss.emit('connection', connection, session),
+      );
+    } catch {
+      socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+    }
+  };
+  secureLan = createSecureLan({
+    app,
+    server,
+    host,
+    fixedPort: port !== 0,
+    identity: networkIdentity,
+    auth,
+    sessionOf,
+    sessionValid,
+    addresses: () =>
+      [
+        ...(host === '127.0.0.1' ? ['127.0.0.1'] : []),
+        ...ownUrls().map((url) => new URL(url).hostname),
+      ]
+        .filter((address, index, all) => all.indexOf(address) === index)
+        .filter(
+          (address) =>
+            address === '127.0.0.1' ||
+            /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(address),
+        ),
+    onPresence: (deviceId) => {
+      const device = devices.get(deviceId);
+      if (!device) return;
+      device.online =
+        !!sockets.get(deviceId)?.size ||
+        secureLan?.hasDevice(deviceId) === true;
+      device.lastSeen = Date.now();
+      if (!handoff?.frozen && !retired()) storage.saveDevice(device);
+      broadcastPresence();
+    },
+    onReady: (deviceId) => ({
+      type: 'ready',
+      deviceId,
+      devices: publicDevices(),
+    }),
+    onUpgrade: handleUpgrade,
+  });
   app.get('/api/info', (_request, response) =>
     response.json({
       serverName: '邻传',
@@ -466,9 +841,136 @@ export function createLanServer(options: LanServerOptions) {
       maxFileBytes: options.maxFileBytes ?? null,
       maxStorageBytes: options.maxStorageBytes ?? null,
       publicUrl,
-      desktopApi: 2,
+      desktopApi: 3,
     }),
   );
+  app.get('/api/network', auth, (_request, response) =>
+    response.json({
+      protocol: 1,
+      groupId: networkIdentity.groupId,
+      publicKey: networkIdentity.publicKey,
+      hostGeneration: networkIdentity.hostGeneration,
+      hostDeviceId: hostDeviceId() ?? null,
+      lanUrls: committedMetadata()?.urls ?? secureLan?.urls() ?? [],
+      httpLanUrls:
+        committedMetadata()?.urls?.map((value) => {
+          const url = new URL(value);
+          return `http://${url.hostname}:${Math.max(1, Number(url.port) - 1)}`;
+        }) ?? lanUrls(),
+      publicUrl,
+      internet: options.hostStatus?.()?.internet ?? 'disabled',
+    }),
+  );
+  app.get('/api/network/probe', (request, response) => {
+    if (retired())
+      return response.status(410).json({ error: '服务已完成主机移交。' });
+    const nonce =
+      typeof request.query.nonce === 'string' ? request.query.nonce : '';
+    if (!/^[0-9a-f]{64}$/.test(nonce))
+      throw new HttpError(400, '网络探测 nonce 无效。');
+    checkRate(
+      networkProbeAttempts,
+      request.ip || request.socket.remoteAddress || 'unknown',
+      120,
+    );
+    const payload = `linchuan-network-v1\n${networkIdentity.groupId}\n${nonce}`;
+    const key = crypto.createPrivateKey({
+      key: Buffer.from(networkIdentity.privateKey, 'base64'),
+      format: 'der',
+      type: 'pkcs8',
+    });
+    const signature = crypto
+      .sign('RSA-SHA256', Buffer.from(payload, 'utf8'), {
+        key,
+        padding: crypto.constants.RSA_PKCS1_PADDING,
+      })
+      .toString('base64');
+    response.json({
+      protocol: 1,
+      groupId: networkIdentity.groupId,
+      nonce,
+      signature,
+    });
+  });
+  const issueNetworkTicket = (
+    request: Request,
+    map: Map<string, { session: Session; expiresAt: number }>,
+    ttlMs: number,
+  ) => {
+    checkRate(
+      networkProbeAttempts,
+      `ticket:${request.ip || request.socket.remoteAddress || 'unknown'}:${sessionOf(request).deviceId}`,
+      20,
+    );
+    for (const [value, ticket] of map)
+      if (ticket.expiresAt <= Date.now()) map.delete(value);
+    const value = token(32);
+    map.set(value, {
+      session: sessionOf(request),
+      expiresAt: Date.now() + ttlMs,
+    });
+    return value;
+  };
+  app.post('/api/network/socket-ticket', auth, (request, response) =>
+    response.json({
+      protocol: 1,
+      ticket: issueNetworkTicket(request, socketTickets, 15000),
+      expiresInMs: 15000,
+    }),
+  );
+  app.post('/api/network/browser-ticket', auth, (request, response) =>
+    response.json({
+      protocol: 1,
+      ticket: issueNetworkTicket(request, browserTickets, 30000),
+      expiresInMs: 30000,
+    }),
+  );
+  app.post('/api/network/browser-restore', (request, response) => {
+    const value =
+      typeof request.body?.ticket === 'string' ? request.body.ticket : '';
+    const record = browserTickets.get(value);
+    browserTickets.delete(value);
+    let session: Session | undefined;
+    if (
+      record &&
+      record.expiresAt > Date.now() &&
+      sessionValid(record.session) &&
+      !handoff?.frozen &&
+      !retired()
+    ) {
+      session = record.session;
+    } else if (!record && !handoff?.frozen && !retired()) {
+      const consumed = storage.consumeHandoffBrowserTicket(
+        hashToken(value),
+        networkIdentity.hostGeneration,
+      );
+      if (consumed) {
+        const oldHash = consumed.sessionHash;
+        const oldSession = sessions.get(oldHash);
+        if (oldSession && oldSession.deviceId === consumed.deviceId) {
+          sessions.delete(oldHash);
+          storage.deleteSession(oldHash);
+          oldSession.token = token();
+          sessions.set(hashToken(oldSession.token), oldSession);
+          storage.saveSession(
+            hashToken(oldSession.token),
+            oldSession.deviceId,
+            oldSession.expiresAt,
+          );
+          session = oldSession;
+        }
+      }
+    }
+    if (!session) throw new HttpError(401, '浏览器恢复票据无效或已过期。');
+    response.setHeader('Set-Cookie', cookieFor(session, request));
+    response.json({
+      protocol: 1,
+      token: session.token,
+      device: devices.get(session.deviceId),
+      devices: publicDevices(),
+      expiresAt: session.expiresAt,
+    });
+  });
   const hostOnly = (
     request: Request,
     _response: Response,
@@ -497,6 +999,683 @@ export function createLanServer(options: LanServerOptions) {
       next();
     });
   };
+  const nativeOnly = (
+    request: Request,
+    response: Response,
+    next: NextFunction,
+  ) => {
+    if (request.get('origin'))
+      throw new HttpError(403, '原生身份接口不接受浏览器 Origin。');
+    auth(request, response, next);
+  };
+  const hostDeviceId = () => storage.getMetadata('host.deviceId');
+  const versionAtLeast = (value: string, minimum: string) => {
+    const parse = (text: string) =>
+      text
+        .split('.')
+        .slice(0, 3)
+        .map((part) => Number(part));
+    const a = parse(value);
+    const b = parse(minimum);
+    if (a.length !== 3 || a.some((part) => !Number.isInteger(part) || part < 0))
+      return false;
+    for (let index = 0; index < 3; index++) {
+      if (a[index] > b[index]) return true;
+      if (a[index] < b[index]) return false;
+    }
+    return true;
+  };
+  app.post('/api/native/capabilities', nativeOnly, (request, response) => {
+    const body = request.body ?? {};
+    const session = sessionOf(request);
+    if (
+      !devices.get(session.deviceId) ||
+      devices.get(session.deviceId)!.type !== 'computer'
+    )
+      throw new HttpError(403, '只有电脑设备可以注册主机能力。');
+    if (
+      typeof body.publicKey !== 'string' ||
+      body.publicKey.length < 300 ||
+      body.publicKey.length > 1000
+    )
+      throw new HttpError(400, '主机公钥无效。');
+    try {
+      const key = crypto.createPublicKey({
+        key: Buffer.from(body.publicKey, 'base64'),
+        format: 'der',
+        type: 'spki',
+      });
+      if (
+        key.asymmetricKeyType !== 'rsa' ||
+        (key.asymmetricKeyDetails?.modulusLength ?? 0) < 2048
+      )
+        throw new Error();
+    } catch {
+      throw new HttpError(400, '主机公钥无效。');
+    }
+    if (
+      typeof body.version !== 'string' ||
+      !/^\d+\.\d+\.\d+$/.test(body.version) ||
+      !versionAtLeast(body.version, '1.2.0')
+    )
+      throw new HttpError(400, '主机版本过低。');
+    if (
+      !Number.isInteger(body.receivePort) ||
+      body.receivePort < 1 ||
+      body.receivePort > 65535 ||
+      !Array.isArray(body.lanUrls) ||
+      body.lanUrls.length > 8
+    )
+      throw new HttpError(400, '主机接收地址无效。');
+    const lanUrls = body.lanUrls.map((value: unknown) =>
+      typeof value === 'string'
+        ? normalizePrivateLanUrl(value, body.receivePort)
+        : null,
+    );
+    if (lanUrls.some((value: string | null): value is null => value === null))
+      throw new HttpError(400, '主机局域网地址无效。');
+    const normalizedUrls = lanUrls as string[];
+    const previous = capabilities.get(session.deviceId);
+    const changed =
+      !previous ||
+      previous.publicKey !== body.publicKey ||
+      previous.version !== body.version ||
+      previous.receivePort !== body.receivePort ||
+      previous.lanUrls.join('|') !== normalizedUrls.join('|');
+    capabilities.set(session.deviceId, {
+      publicKey: body.publicKey,
+      version: body.version,
+      receivePort: body.receivePort,
+      lanUrls: normalizedUrls,
+      updatedAt: Date.now(),
+    });
+    if (changed) broadcastPresence();
+    response.json({ registered: true, hostDeviceId: hostDeviceId() ?? null });
+  });
+  app.post('/api/host/owner', desktopHostOnly, (request, response) => {
+    const deviceId =
+      typeof request.body?.deviceId === 'string' ? request.body.deviceId : '';
+    const device = devices.get(deviceId);
+    if (!device || device.type !== 'computer')
+      throw new HttpError(400, '主机设备不存在。');
+    storage.setMetadata('host.deviceId', deviceId);
+    response.json({ hostDeviceId: deviceId });
+  });
+  app.post('/api/host/handoff/prepare', hostOnly, (request, response) => {
+    if (retired()) throw new HttpError(409, '此服务已完成主机移交。');
+    if (handoff) throw new HttpError(409, '已有主机移交事务。');
+    if (activeUploads.size)
+      throw new HttpError(409, '仍有活动传输，暂不能移交。');
+    const targetDeviceId =
+      typeof request.body?.targetDeviceId === 'string'
+        ? request.body.targetDeviceId
+        : '';
+    const target = devices.get(targetDeviceId);
+    const capability = capabilities.get(targetDeviceId);
+    if (
+      !target ||
+      target.type !== 'computer' ||
+      !target.online ||
+      !capability ||
+      capability.updatedAt + 20000 < Date.now() ||
+      !versionAtLeast(capability.version, '1.2.0')
+    )
+      throw new HttpError(409, '目标电脑未在线或不支持主机移交。');
+    const id = token(24);
+    const root = path.join(options.dataDir, `.handoff-${id}`);
+    const snapshotPath = path.join(root, 'linchuan.sqlite');
+    const chunksPath = path.join(root, 'chunks');
+    fs.mkdirSync(root, { recursive: true });
+    const browserTickets = [...sessions.entries()]
+      .filter(([, session]) => sessionValid(session))
+      .map(([sessionHash, session]) => ({
+        sessionHash,
+        deviceId: session.deviceId,
+        value: token(32),
+      }));
+    const browserTicketExpiresAt = Date.now() + 24 * 60 * 60 * 1000;
+    for (const ticket of browserTickets)
+      storage.saveHandoffBrowserTicket(
+        hashToken(ticket.value),
+        ticket.sessionHash,
+        ticket.deviceId,
+        networkIdentity.hostGeneration + 1,
+        browserTicketExpiresAt,
+      );
+    handoff = {
+      id,
+      targetDeviceId,
+      generation: networkIdentity.hostGeneration + 1,
+      targetPublicKey: capability.publicKey,
+      receivePort: capability.receivePort,
+      startedAt: Date.now(),
+      expiresAt: Date.now() + handoffTtlMs,
+      frozen: true,
+      committed: false,
+      activated: false,
+      ready: false,
+      snapshotPath,
+      chunksPath,
+      chunkBytes: 0,
+      nextChunk: 0,
+      chunkQuota: 16 * 1024 * 1024,
+      activeChunkRequests: 0,
+      browserTickets,
+    };
+    scheduleHandoffExpiry(handoff);
+    fs.mkdirSync(chunksPath, { recursive: true });
+    try {
+      storage.snapshotInto(snapshotPath);
+      storage.patchSnapshotHandoff(
+        snapshotPath,
+        handoff.generation,
+        targetDeviceId,
+      );
+      const exportFiles: Array<{
+        index: number;
+        path: string;
+        size: number;
+        sha256: string;
+        source: string;
+      }> = [
+        {
+          index: 0,
+          path: 'linchuan.sqlite',
+          size: fs.statSync(snapshotPath).size,
+          sha256: crypto
+            .createHash('sha256')
+            .update(fs.readFileSync(snapshotPath))
+            .digest('hex'),
+          source: snapshotPath,
+        },
+      ];
+      let index = 1;
+      for (const file of files.values()) {
+        if (!fs.existsSync(file.path)) continue;
+        const relative = path.join('uploads', file.ref.id);
+        const target = path.join(root, relative);
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.copyFileSync(file.path, target);
+        const stat = fs.statSync(target);
+        exportFiles.push({
+          index: index++,
+          path: relative.replaceAll('\\', '/'),
+          size: stat.size,
+          sha256: crypto
+            .createHash('sha256')
+            .update(fs.readFileSync(target))
+            .digest('hex'),
+          source: target,
+        });
+      }
+      handoff.files = exportFiles;
+      handoff.chunkQuota =
+        exportFiles.reduce((sum, file) => sum + file.size, 0) +
+        exportFiles.length * 512 +
+        16 * 1024 * 1024;
+    } catch (error) {
+      handoff = null;
+      storage.deleteHandoffBrowserTickets(networkIdentity.hostGeneration + 1);
+      try {
+        removeHandoffStaging(id);
+      } catch {
+        // Preserve an unsafe tree for explicit recovery rather than deleting it recursively.
+      }
+      throw new HttpError(
+        409,
+        `无法创建主机移交快照：${error instanceof Error ? error.message : '未知错误'}`,
+      );
+    }
+    response.json({
+      id,
+      groupId: networkIdentity.groupId,
+      generation: handoff.generation,
+      targetDeviceId,
+      targetPublicKey: capability.publicKey,
+      receivePort: capability.receivePort,
+      expiresAt: handoff.expiresAt,
+    });
+  });
+  app.get('/api/host/handoff/export', hostOnly, (_request, response) => {
+    renewHandoff();
+    if (
+      !handoff?.frozen ||
+      !handoff.snapshotPath ||
+      !fs.existsSync(handoff.snapshotPath)
+    )
+      throw new HttpError(404, '没有可导出的移交快照。');
+    response.json({
+      id: handoff.id,
+      groupId: networkIdentity.groupId,
+      generation: handoff.generation,
+      files: (handoff.files ?? []).map(({ source: _source, ...file }) => file),
+      totalBytes: (handoff.files ?? []).reduce(
+        (sum, file) => sum + file.size,
+        0,
+      ),
+    });
+  });
+  app.get('/api/host/handoff/file/:index', hostOnly, (request, response) => {
+    renewHandoff();
+    const index = Number(request.params.index);
+    const exportFile = handoff?.files?.find((file) => file.index === index);
+    if (!exportFile || !fs.existsSync(exportFile.source))
+      throw new HttpError(404, '移交文件不存在。');
+    response.type('application/octet-stream');
+    const stream = fs.createReadStream(exportFile.source);
+    stream.once('error', () => {
+      if (!response.headersSent) response.status(404).end();
+      else response.destroy();
+    });
+    stream.pipe(response);
+  });
+  app.put(
+    '/api/host/handoff/chunks/:index',
+    hostOnly,
+    async (request, response) => {
+      renewHandoff();
+      if (!handoff?.frozen || !handoff.chunksPath)
+        throw new HttpError(404, '没有活动移交事务。');
+      const current = handoff;
+      const chunksPath = current.chunksPath!;
+      const index = Number(request.params.index);
+      const length = Number(request.headers['content-length'] ?? 0);
+      if (
+        !Number.isInteger(index) ||
+        index !== current.nextChunk ||
+        !Number.isSafeInteger(length) ||
+        length < 16 ||
+        length > 8 * 1024 * 1024 ||
+        current.chunkBytes + length > current.chunkQuota
+      )
+        throw new HttpError(400, '移交分块无效。');
+      let received = 0;
+      let claimed = false;
+      let fileDescriptor: number | undefined;
+      let output: fs.WriteStream | undefined;
+      current.activeChunkRequests += 1;
+      const leaseInterval = setInterval(
+        () => renewHandoff(current),
+        Math.max(10, Math.min(30000, Math.floor(handoffTtlMs / 3))),
+      );
+      leaseInterval.unref?.();
+      try {
+        const disk = await diskStatfs();
+        if (disk.bavail * disk.bsize < BigInt(length) + 16n * 1024n * 1024n)
+          throw new HttpError(413, '磁盘空间不足。');
+      } catch (error) {
+        clearInterval(leaseInterval);
+        current.activeChunkRequests = Math.max(
+          0,
+          current.activeChunkRequests - 1,
+        );
+        if (error instanceof HttpError) throw error;
+        throw new HttpError(413, '无法确认磁盘空间。');
+      }
+      const file = path.join(chunksPath, `${index}.part`);
+      request.on('data', (part: Buffer) => {
+        received += part.length;
+      });
+      try {
+        // Claim the exact path before streaming.  If wx loses a race, this
+        // request must never remove the other uploader's part file.
+        // openSync closes the race without yielding while the request body is
+        // already flowing; an async open here could lose buffered bytes.
+        fileDescriptor = fs.openSync(file, 'wx');
+        claimed = true;
+        output = fs.createWriteStream(file, {
+          fd: fileDescriptor,
+          autoClose: true,
+        });
+        await pipeline(request, output);
+        if (received !== length) throw new Error('移交分块长度不一致。');
+      } catch (error) {
+        // A disconnected sender must not leave an owned `.part` that blocks
+        // the same ordered index on retry.
+        if (claimed) await fsp.rm(file, { force: true }).catch(() => {});
+        throw error;
+      } finally {
+        if (fileDescriptor !== undefined && !output)
+          try {
+            fs.closeSync(fileDescriptor);
+          } catch {
+            /* best effort */
+          }
+        clearInterval(leaseInterval);
+        current.activeChunkRequests = Math.max(
+          0,
+          current.activeChunkRequests - 1,
+        );
+      }
+      if (handoff !== current || current.committed || !current.frozen) {
+        if (claimed) await fsp.rm(file, { force: true }).catch(() => {});
+        throw new HttpError(409, '移交事务已结束。');
+      }
+      current.chunkBytes += length;
+      current.nextChunk += 1;
+      response.status(204).end();
+    },
+  );
+  app.post('/api/host/handoff/seal', hostOnly, (request, response) => {
+    if (!handoff?.frozen || !handoff.chunksPath)
+      throw new HttpError(404, '没有活动移交事务。');
+    const { envelopeJson, totalChunks, totalBytes, sha256 } =
+      request.body ?? {};
+    if (
+      typeof envelopeJson !== 'string' ||
+      envelopeJson.length > 16 * 1024 ||
+      !Number.isInteger(totalChunks) ||
+      totalChunks < 0 ||
+      totalChunks > 1_000_000 ||
+      !Number.isSafeInteger(totalBytes) ||
+      totalBytes < 0 ||
+      totalChunks !== handoff.nextChunk ||
+      totalBytes !== handoff.chunkBytes ||
+      typeof sha256 !== 'string' ||
+      !/^[0-9a-f]{64}$/.test(sha256)
+    )
+      throw new HttpError(400, '移交封装无效。');
+    let envelope: unknown;
+    try {
+      envelope = JSON.parse(envelopeJson);
+    } catch {
+      throw new HttpError(400, '移交封装 JSON 无效。');
+    }
+    if (!envelope || typeof envelope !== 'object')
+      throw new HttpError(400, '移交封装无效。');
+    const signaturePayload = `linchuan-handoff-v1\n${handoff.id}\n${networkIdentity.groupId}\n${handoff.generation}\n${handoff.targetDeviceId}\n${totalChunks}\n${totalBytes}\n${sha256}\n${crypto.createHash('sha256').update(envelopeJson).digest('hex')}`;
+    const privateKey = crypto.createPrivateKey({
+      key: Buffer.from(networkIdentity.privateKey, 'base64'),
+      format: 'der',
+      type: 'pkcs8',
+    });
+    const signature = crypto
+      .sign('RSA-SHA256', Buffer.from(signaturePayload), {
+        key: privateKey,
+        padding: crypto.constants.RSA_PKCS1_PADDING,
+      })
+      .toString('base64');
+    handoff.offer = {
+      envelope: envelopeJson,
+      envelopeJson,
+      totalChunks,
+      totalBytes,
+      sha256,
+      signature,
+    };
+    handoff.chunkQuota = totalBytes + totalChunks * 512 + 16 * 1024 * 1024;
+    response.status(204).end();
+  });
+  const targetHandoff = (request: Request) => {
+    const session = sessionOf(request);
+    if (
+      !handoff ||
+      handoff.expiresAt <= Date.now() ||
+      session.deviceId !== handoff.targetDeviceId
+    )
+      throw new HttpError(404, '没有可用的主机移交。');
+    return handoff;
+  };
+  app.get('/api/handoff/inbox', auth, (request, response) => {
+    renewHandoff();
+    const current = targetHandoff(request);
+    if (!current.offer) return response.json({ offer: null });
+    response.json({
+      offer: {
+        id: current.id,
+        groupId: networkIdentity.groupId,
+        generation: current.generation,
+        targetDeviceId: current.targetDeviceId,
+        targetPublicKey: current.targetPublicKey,
+        receivePort: current.receivePort,
+        state: current.ready ? 'ready' : 'sealed',
+        urls: current.redirectUrls ?? [],
+        ...current.offer,
+      },
+    });
+  });
+  app.get('/api/handoff/chunks/:index', auth, (request, response) => {
+    renewHandoff();
+    const current = targetHandoff(request);
+    const index = Number(request.params.index);
+    const file =
+      current.chunksPath && path.join(current.chunksPath, `${index}.part`);
+    if (!file || !Number.isInteger(index) || index < 0)
+      throw new HttpError(404, '移交分块不存在。');
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(file);
+    } catch {
+      throw new HttpError(404, '移交分块不存在。');
+    }
+    if (!stat.isFile() || stat.isSymbolicLink())
+      throw new HttpError(404, '移交分块不存在。');
+    response.type('application/octet-stream');
+    const stream = fs.createReadStream(file);
+    stream.once('error', () => {
+      if (!response.headersSent) response.status(404).end();
+      else response.destroy();
+    });
+    request.once('aborted', () => {
+      if (!stream.destroyed) stream.destroy();
+    });
+    stream.pipe(response);
+  });
+  app.post('/api/handoff/ready', auth, (request, response) => {
+    renewHandoff();
+    const current = targetHandoff(request);
+    const submittedUrls = request.body?.urls;
+    // Native clients may enumerate more interfaces at ready time than fit in
+    // their capability advertisement.  The capability's first eight entries
+    // are the authenticated allowlist; never propagate later candidates.
+    const urls = Array.isArray(submittedUrls)
+      ? submittedUrls.slice(0, 8)
+      : null;
+    const capability = capabilities.get(current.targetDeviceId);
+    const allowedUrls = capability?.lanUrls ?? [];
+    const normalizedUrls =
+      urls && capability
+        ? urls.map((value) =>
+            typeof value === 'string'
+              ? normalizePrivateLanUrl(value, capability.receivePort)
+              : null,
+          )
+        : null;
+    if (
+      !normalizedUrls?.length ||
+      normalizedUrls.some(
+        (value) => value === null || !allowedUrls.includes(value),
+      )
+    )
+      throw new HttpError(400, '新主机地址无效。');
+    const validUrls = normalizedUrls as string[];
+    current.ready = true;
+    current.redirectUrls = validUrls.map((value) => {
+      const url = new URL(value);
+      return `https://${url.hostname}:${securePortFor(Number(url.port))}`;
+    });
+    response.json({ ready: true });
+  });
+  app.get('/api/handoff/status', auth, (request, response) => {
+    renewHandoff();
+    const id = typeof request.query.id === 'string' ? request.query.id : '';
+    if (!handoff || handoff.id !== id) {
+      const persisted = committedMetadata();
+      if (
+        !persisted ||
+        persisted.id !== id ||
+        sessionOf(request).deviceId !== persisted.targetDeviceId
+      )
+        return response.status(404).json({ error: '移交不存在。' });
+      return response.json({
+        id: persisted.id,
+        state: 'committed',
+        generation: persisted.generation,
+        targetDeviceId: persisted.targetDeviceId,
+        urls: persisted.urls,
+        activated: persisted.activated,
+      });
+    }
+    if (sessionOf(request).deviceId !== handoff.targetDeviceId)
+      throw new HttpError(403, '无权读取此移交。');
+    response.json({
+      id: handoff.id,
+      generation: handoff.generation,
+      targetDeviceId: handoff.targetDeviceId,
+      state: handoff.committed
+        ? 'committed'
+        : handoff.ready
+          ? 'ready'
+          : handoff.offer
+            ? 'offered'
+            : 'preparing',
+      activated: handoff.activated,
+      redirectUrls: handoff.redirectUrls ?? [],
+    });
+  });
+  app.get('/api/host/handoff/status', hostOnly, (request, response) => {
+    renewHandoff();
+    const id = typeof request.query.id === 'string' ? request.query.id : '';
+    if (!handoff || handoff.id !== id) {
+      const persisted = committedMetadata();
+      if (!persisted || persisted.id !== id)
+        return response.status(404).json({ error: '移交不存在。' });
+      return response.json({
+        id: persisted.id,
+        state: 'committed',
+        generation: persisted.generation,
+        targetDeviceId: persisted.targetDeviceId,
+        urls: persisted.urls,
+        activated: persisted.activated,
+      });
+    }
+    response.json({
+      id: handoff.id,
+      generation: handoff.generation,
+      targetDeviceId: handoff.targetDeviceId,
+      state: handoff.committed
+        ? 'committed'
+        : handoff.ready
+          ? 'ready'
+          : handoff.offer
+            ? 'offered'
+            : 'preparing',
+      activated: handoff.activated,
+      redirectUrls: handoff.redirectUrls ?? [],
+    });
+  });
+  app.post('/api/handoff/activated', auth, (request, response) => {
+    const current = handoff && handoff.id === request.body?.id ? handoff : null;
+    if (current && sessionOf(request).deviceId !== current.targetDeviceId)
+      throw new HttpError(403, '无权确认此主机移交。');
+    const persisted = committedMetadata();
+    if (current) {
+      if (!current.committed) throw new HttpError(409, '移交尚未提交。');
+      // Remove only this committed transaction's staging tree.  This must
+      // finish before the activated marker and ACK become observable.
+      removeHandoffStaging(current.id);
+      current.activated = true;
+    } else if (
+      !persisted ||
+      persisted.id !== request.body?.id ||
+      persisted.targetDeviceId !== sessionOf(request).deviceId
+    )
+      throw new HttpError(409, '移交尚未提交。');
+    else {
+      // An ACK retry after a source restart is idempotent, but remains scoped
+      // to the committed target and exact staging directory.
+      removeHandoffStaging(persisted.id);
+    }
+    storage.setMetadata('handoff.activated', '1');
+    response.json({ activated: true });
+  });
+  app.post('/api/host/handoff/commit', hostOnly, (request, response) => {
+    if (
+      !handoff ||
+      handoff.id !== request.body?.id ||
+      !handoff.ready ||
+      !handoff.offer
+    )
+      throw new HttpError(409, '目标主机尚未准备好。');
+    const current = handoff;
+    const nextGeneration = networkIdentity.hostGeneration + 1;
+    storage.setMetadataMany([
+      ['network.hostGeneration', String(nextGeneration)],
+      ['host.deviceId', current.targetDeviceId],
+      ['host.retired', '1'],
+      ['handoff.id', current.id],
+      ['handoff.generation', String(nextGeneration)],
+      ['handoff.targetDeviceId', current.targetDeviceId],
+      ['handoff.urls', JSON.stringify(current.redirectUrls ?? [])],
+      ['handoff.activated', '0'],
+    ]);
+    networkIdentity.hostGeneration = nextGeneration;
+    current.committed = true;
+    current.frozen = true;
+    for (const group of sockets.values()) {
+      for (const socket of group) {
+        sendSocket(
+          socket,
+          JSON.stringify({
+            type: 'handoff',
+            state: 'committed',
+            browserTicket: current.browserTickets?.find(
+              (ticket) =>
+                ticket.sessionHash ===
+                hashToken(socketSessions.get(socket)?.token ?? ''),
+            )?.value,
+            redirectUrls: current.redirectUrls ?? [],
+            network: {
+              protocol: 1,
+              groupId: networkIdentity.groupId,
+              publicKey: networkIdentity.publicKey,
+              hostGeneration: nextGeneration,
+              hostDeviceId: current.targetDeviceId,
+              lanUrls: current.redirectUrls ?? [],
+              publicUrl,
+            },
+          }),
+        );
+        secureLan?.emit(
+          socketSessions.get(socket)?.deviceId ?? null,
+          JSON.stringify({
+            type: 'handoff',
+            state: 'committed',
+            browserTicket: current.browserTickets?.find(
+              (ticket) =>
+                ticket.sessionHash ===
+                hashToken(socketSessions.get(socket)?.token ?? ''),
+            )?.value,
+            redirectUrls: current.redirectUrls ?? [],
+            network: {
+              protocol: 1,
+              groupId: networkIdentity.groupId,
+              publicKey: networkIdentity.publicKey,
+              hostGeneration: nextGeneration,
+              hostDeviceId: current.targetDeviceId,
+              lanUrls: current.redirectUrls ?? [],
+              publicUrl,
+            },
+          }),
+        );
+      }
+    }
+    response.json({
+      id: current.id,
+      state: 'committed',
+      hostGeneration: nextGeneration,
+      redirectUrls: current.redirectUrls ?? [],
+    });
+  });
+  app.post('/api/host/handoff/abort', hostOnly, (request, response) => {
+    if (!handoff || handoff.id !== request.body?.id || handoff.committed)
+      throw new HttpError(409, '移交不存在或已提交。');
+    if (handoff.snapshotPath) removeHandoffStaging(handoff.id);
+    handoff = null;
+    storage.deleteHandoffBrowserTickets(networkIdentity.hostGeneration + 1);
+    clearTimeout(handoffTimer);
+    response.status(204).end();
+  });
   app.get('/api/host', hostOnly, (_request, response) =>
     response.json({
       code: joinCode,
@@ -517,6 +1696,8 @@ export function createLanServer(options: LanServerOptions) {
     '/api/host/desktop-session',
     desktopHostOnly,
     (request, response) => {
+      if (handoff?.frozen || retired())
+        throw new HttpError(409, '主机移交进行中，暂时不能建立新会话。');
       checkRate(joinAttempts, `desktop:${request.ip || 'unknown'}`, 20);
       checkRate(joinAttempts, 'global-desktop-attempts', 30);
       if (storage.joinFailures() >= maxJoinFailures)
@@ -548,6 +1729,7 @@ export function createLanServer(options: LanServerOptions) {
         device.id,
         session.expiresAt,
       );
+      if (!hostDeviceId()) storage.setMetadata('host.deviceId', device.id);
       response.setHeader('Set-Cookie', cookieFor(session, request));
       response.json({
         token: session.token,
@@ -558,6 +1740,8 @@ export function createLanServer(options: LanServerOptions) {
     },
   );
   app.post('/api/host/code', hostOnly, (_request, response) => {
+    if (handoff?.frozen || retired())
+      throw new HttpError(409, '主机移交进行中，暂时不能刷新连接码。');
     joinCode = String(crypto.randomInt(100000, 1000000));
     storage.resetJoinFailures();
     response.json({ code: joinCode, joinLocked: false });
@@ -590,6 +1774,8 @@ export function createLanServer(options: LanServerOptions) {
     }
   });
   app.post('/api/join', (request, response) => {
+    if (handoff?.frozen || retired())
+      throw new HttpError(409, '主机移交进行中，暂时不能加入服务。');
     checkRate(joinAttempts, request.ip || 'unknown', 20);
     checkRate(joinAttempts, 'global-join-attempts', 30);
     if (storage.joinFailures() >= maxJoinFailures)
@@ -633,7 +1819,7 @@ export function createLanServer(options: LanServerOptions) {
     };
     devices.set(id, device);
     sessions.set(hashToken(session.token), session);
-    storage.saveDevice(device);
+    if (!handoff?.frozen && !retired()) storage.saveDevice(device);
     storage.saveSession(hashToken(session.token), id, session.expiresAt);
     response.setHeader('Set-Cookie', cookieFor(session, request));
     broadcastPresence();
@@ -682,7 +1868,7 @@ export function createLanServer(options: LanServerOptions) {
     device.name = name.trim();
     device.type = type;
     device.lastSeen = Date.now();
-    storage.saveDevice(device);
+    if (!handoff?.frozen && !retired()) storage.saveDevice(device);
     broadcastPresence();
     response.json({ device });
   });
@@ -767,6 +1953,7 @@ export function createLanServer(options: LanServerOptions) {
     const payload = JSON.stringify({ type: 'message-deleted', id: message.id });
     for (const socket of sockets.get(requester) ?? [])
       sendSocket(socket, payload);
+    secureLan?.emit(requester, payload);
     response.status(204).end();
   });
   app.post('/api/files', auth, async (request, response) => {
@@ -1107,27 +2294,7 @@ export function createLanServer(options: LanServerOptions) {
       });
     },
   );
-  server.on('upgrade', (request, socket, head) => {
-    try {
-      if (!validateOrigin(request) || closing) throw new Error();
-      const url = new URL(request.url ?? '', `http://${request.headers.host}`);
-      const queryToken = url.searchParams.get('token') ?? '';
-      const cookieToken = request.headers.cookie?.match(
-        /(?:^|;\s*)linchuan_session=([^;]+)/,
-      )?.[1];
-      // Same-origin browsers send the HttpOnly session cookie automatically.
-      // Keep the query-token form for existing non-browser clients, but allow
-      // cookie-only handshakes so credentials do not appear in WS URLs/logs.
-      const session = resolveSession(queryToken || cookieToken || '');
-      if (url.pathname !== '/ws' || !session || !sessionValid(session))
-        throw new Error();
-      wss.handleUpgrade(request, socket, head, (connection) =>
-        wss.emit('connection', connection, session),
-      );
-    } catch {
-      socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
-    }
-  });
+  server.on('upgrade', handleUpgrade);
   wss.on('connection', (socket: WebSocket, session: Session) => {
     socketSessions.set(socket, session);
     let group = sockets.get(session.deviceId);
@@ -1139,7 +2306,7 @@ export function createLanServer(options: LanServerOptions) {
     const device = devices.get(session.deviceId)!;
     device.online = true;
     device.lastSeen = Date.now();
-    storage.saveDevice(device);
+    if (!handoff?.frozen && !retired()) storage.saveDevice(device);
     let alive = true;
     socket.on('error', () => socket.terminate());
     socket.on('pong', () => {
@@ -1169,11 +2336,11 @@ export function createLanServer(options: LanServerOptions) {
     socket.once('close', () => {
       clearInterval(heartbeat);
       group.delete(socket);
-      if (!group.size) {
+      if (!group.size && !secureLan?.hasDevice(session.deviceId)) {
         sockets.delete(session.deviceId);
         device.online = false;
         device.lastSeen = Date.now();
-        storage.saveDevice(device);
+        if (!handoff?.frozen && !retired()) storage.saveDevice(device);
         forgetEmptyDevice(session.deviceId);
       }
       broadcastPresence();
@@ -1203,6 +2370,12 @@ export function createLanServer(options: LanServerOptions) {
       server.once('listening', ready);
       server.listen(port, host);
     });
+    try {
+      await secureLan?.start();
+    } catch (error) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      throw error;
+    }
   };
   let closeJob: Promise<void> | undefined;
   const close = () =>
@@ -1210,6 +2383,7 @@ export function createLanServer(options: LanServerOptions) {
       closing = true;
       clearInterval(interval);
       for (const cancel of activeUploads.values()) cancel();
+      await secureLan?.close();
       for (const socket of wss.clients) socket.terminate();
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -1228,6 +2402,11 @@ export function createLanServer(options: LanServerOptions) {
     getJoinCode: () => joinCode,
     getPort: () => boundPort(),
     getUrls: ownUrls,
+    getSecureUrls: () => secureLan?.urls() ?? [],
+    getSecurePort: () => {
+      const url = secureLan?.urls()[0];
+      return url ? Number(new URL(url).port) : 0;
+    },
     devices,
     messages,
     files,

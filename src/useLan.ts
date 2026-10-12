@@ -3,6 +3,15 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, randomId } from './api';
 import { uploadFile } from './upload';
 import type { Connection, Device, Message, Session, Upload } from './types';
+import {
+  networkMode,
+  localConnected,
+  onLocalEvent,
+  followHost,
+  onNetworkChange,
+  selectNetwork,
+  socketUrl,
+} from './network';
 
 export function useLan(session: Session, onExpired: () => void) {
   const [devices, setDevices] = useState<Device[]>(session.devices);
@@ -10,6 +19,7 @@ export function useLan(session: Session, onExpired: () => void) {
   const [unread, setUnread] = useState<Record<string, number>>({});
   const [target, setTarget] = useState('all');
   const [connection, setConnection] = useState<Connection>('connecting');
+  const [network, setNetwork] = useState(networkMode);
   const [error, setError] = useState('');
   const [uploads, setUploads] = useState<Upload[]>([]);
   type History = {
@@ -118,6 +128,7 @@ export function useLan(session: Session, onExpired: () => void) {
           };
         });
       } catch (cause) {
+        if (!alive.current) return;
         if ((cause as { status?: number }).status === 401)
           expiredCallback.current();
         else if (alive.current) setError((cause as Error).message);
@@ -140,11 +151,25 @@ export function useLan(session: Session, onExpired: () => void) {
     let timer: ReturnType<typeof setTimeout>;
     let attempt = 0;
     let stopped = false;
-    const connect = () => {
+    let connecting = false;
+    const connect = async () => {
       if (stopped) return;
-      socket = new WebSocket(
-        `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws`,
-      );
+      if (connecting) return;
+      connecting = true;
+      try {
+        await selectNetwork();
+        const url = await socketUrl();
+        if (stopped) return;
+        socket = new WebSocket(url);
+      } catch {
+        if (!stopped) {
+          setConnection('reconnecting');
+          timer = setTimeout(() => void connect(), 2000);
+        }
+        return;
+      } finally {
+        connecting = false;
+      }
       socket.onopen = () => {
         attempt = 0;
         setConnection('connected');
@@ -153,56 +178,80 @@ export function useLan(session: Session, onExpired: () => void) {
       };
       socket.onmessage = (event) => {
         try {
-          const data = JSON.parse(event.data);
-          if (data.type === 'presence') {
-            setDevices(data.devices);
-            setTarget((current) =>
-              current !== 'all' &&
-              !data.devices.some((device: Device) => device.id === current)
-                ? 'all'
-                : current,
-            );
-          }
-          if (data.type === 'message') addMessage(data.message, true);
-          if (data.type === 'message-deleted') {
-            deleted.current.add(data.id);
-            setMessages((current) =>
-              Object.fromEntries(
-                Object.entries(current).map(([key, items]) => [
-                  key,
-                  items.filter((item) => item.id !== data.id),
-                ]),
-              ),
-            );
-          }
+          receive(JSON.parse(event.data));
         } catch {
           setError(t('收到的消息格式异常，请刷新页面。'));
         }
       };
       socket.onclose = async (event) => {
         if (stopped) return;
-        setConnection('reconnecting');
-        if (event.code === 4001 || event.code === 1008) {
+        setConnection(localConnected() ? 'connected' : 'reconnecting');
+        if ((event.code === 4001 || event.code === 1008) && !localConnected()) {
           expiredCallback.current();
           return;
         }
         try {
           await api('/api/session', {}, session.token);
         } catch (cause) {
-          if ((cause as { status?: number }).status === 401) {
+          if (
+            (cause as { status?: number }).status === 401 &&
+            !localConnected()
+          ) {
             if (!stopped) expiredCallback.current();
             return;
           }
         }
         if (stopped) return;
-        timer = setTimeout(connect, Math.min(1000 * 2 ** attempt++, 10000));
+        timer = setTimeout(
+          () => void connect(),
+          Math.min(1000 * 2 ** attempt++, 10000),
+        );
       };
       socket.onerror = () => socket.close();
+    };
+    const receive = (value: unknown) => {
+      try {
+        const data = value as {
+          type: string;
+          devices: Device[];
+          message: Message;
+          id: string;
+          network: Parameters<typeof followHost>[0];
+          browserTicket?: string;
+        };
+        if (data.type === 'presence') {
+          setDevices(data.devices);
+          setTarget((current) =>
+            current !== 'all' &&
+            !data.devices.some((device: Device) => device.id === current)
+              ? 'all'
+              : current,
+          );
+        }
+        if (data.type === 'message') addMessage(data.message, true);
+        if (data.type === 'message-deleted') {
+          deleted.current.add(data.id);
+          setMessages((current) =>
+            Object.fromEntries(
+              Object.entries(current).map(([key, items]) => [
+                key,
+                items.filter((item) => item.id !== data.id),
+              ]),
+            ),
+          );
+        }
+        if (data.type === 'handoff') {
+          setConnection('reconnecting');
+          followHost(data.network, data.browserTicket);
+        }
+      } catch {
+        setError(t('收到的消息格式异常，请刷新页面。'));
+      }
     };
     const resume = () => {
       if (socket?.readyState === WebSocket.CLOSED) {
         clearTimeout(timer);
-        connect();
+        void connect();
       } else if (socket?.readyState === WebSocket.OPEN)
         void loadHistory(selected.current);
     };
@@ -212,12 +261,29 @@ export function useLan(session: Session, onExpired: () => void) {
         resume();
       }
     };
-    connect();
+    void connect();
+    const monitor = setInterval(() => {
+      void selectNetwork();
+    }, 15000);
+    const unsubscribe = onNetworkChange(() => {
+      setNetwork(networkMode());
+      setConnection(
+        localConnected() || socket?.readyState === WebSocket.OPEN
+          ? 'connected'
+          : 'reconnecting',
+      );
+      if (localConnected()) void loadHistory(selected.current);
+      else resume();
+    });
+    const unsubscribeEvents = onLocalEvent(receive);
     window.addEventListener('online', resume);
     document.addEventListener('visibilitychange', visible);
     return () => {
       stopped = true;
       clearTimeout(timer);
+      clearInterval(monitor);
+      unsubscribe();
+      unsubscribeEvents();
       socket?.close();
       window.removeEventListener('online', resume);
       document.removeEventListener('visibilitychange', visible);
@@ -312,6 +378,7 @@ export function useLan(session: Session, onExpired: () => void) {
     target,
     setTarget,
     connection,
+    network,
     error,
     setError,
     send,

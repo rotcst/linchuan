@@ -39,9 +39,15 @@ public sealed class MainWindow : AppWindow
     private bool _exit, _busy, _loading;
     private int _generation;
     private readonly UpdateChecker _updates;
+    private readonly BackendHost _backend;
+    private readonly HostHandoff _handoff;
+    private bool _handoffBusy;
+    private LanClient? _previousHandoffClient;
     public MainWindow(DesktopOptions options, BackendHost backend, UpdateChecker? updates = null) : base(integratedCaption: true)
     {
-        _updates = updates ?? new(); _options = options; _preferences = Preferences.Load(options.ClientDir);
+        _updates = updates ?? new(); _options = options; _backend = backend; _preferences = Preferences.Load(options.ClientDir);
+        _handoff = new HostHandoff(options.StorageRoot.Length > 0 ? options.StorageRoot : options.DataDir, options.ClientDir, options.Port, ActivateHostAsync, DemoteHostAsync, value => Dispatcher.BeginInvoke(() => { _transfer.Text = L.T(value); }));
+        _handoff.Completed = async () => { var previous = _previousHandoffClient; _previousHandoffClient = null; if (previous is not null && previous != Client) await previous.DisposeAsync(); };
         Target = options.ServerUri ?? (_preferences.Server.Length > 0 ? _preferences.Server : $"http://127.0.0.1:{options.Port}");
         _settings = new SettingsStore(Path.Combine(options.ClientDir, "sessions.json"));
         L.Set(_preferences.Language); Theme.Apply(_preferences.Theme);
@@ -60,6 +66,9 @@ public sealed class MainWindow : AppWindow
     public string Conversation => _conversation;
     public ObservableCollection<MessageView> Messages => _messages;
     public bool TransferBusy => _busy;
+    internal bool HostTransferBusy => _handoffBusy;
+    internal string VerificationError => _error.Text;
+    internal string VerificationHandoffProgress => _transfer.Text;
     public CancellationToken Lifetime => _lifetime.Token;
     public event Action? ExitRequested;
     internal event Action<string>? CopyCompleted;
@@ -116,8 +125,11 @@ public sealed class MainWindow : AppWindow
     {
         var panel = new StackPanel(); var title = Ui.Text("连接设备", 20); title.FontWeight = FontWeights.SemiBold; panel.Children.Add(title); var subtitle = Ui.Text("扫码或输入地址加入", 12, "Muted"); subtitle.Margin = new Thickness(0, 4, 0, 8); panel.Children.Add(subtitle);
         _hostStatus = Ui.Text(GetHostStatusText(), 12, "Muted"); AutomationProperties.SetAutomationId(_hostStatus, "HostStatus"); _hostStatus.Margin = new Thickness(0, 0, 0, 16); panel.Children.Add(_hostStatus);
-        panel.Children.Add(Ui.Text("这台电脑的连接码", 12, "Muted")); _code = Ui.Text(_host?.Code ?? "— — —", 38); _code.FontFamily = new FontFamily("Cascadia Code"); _code.FontWeight = FontWeights.Bold; _code.Margin = new Thickness(0, 8, 0, 6); panel.Children.Add(_code);
-        panel.Children.Add(Ui.Row(CreateCopyButton("复制连接码", () => _host?.Code ?? "", "CopyCode", "连接码已复制"), Ui.AsyncButton("刷新连接码", () => RunAsync(async () => { var client = Client!; var updated = await client.RefreshCodeAsync(Lifetime); if (Client != client) return; _host ??= updated; _host.Code = updated.Code; _host.JoinLocked = updated.JoinLocked; _code.Text = updated.Code; }), "RefreshCode")));
+        if (_host is not null)
+        {
+            panel.Children.Add(Ui.Text("这台电脑的连接码", 12, "Muted")); _code = Ui.Text(_host.Code, 38); _code.FontFamily = new FontFamily("Cascadia Code"); _code.FontWeight = FontWeights.Bold; _code.Margin = new Thickness(0, 8, 0, 6); panel.Children.Add(_code);
+            panel.Children.Add(Ui.Row(CreateCopyButton("复制连接码", () => _host?.Code ?? "", "CopyCode", "连接码已复制"), Ui.AsyncButton("刷新连接码", () => RunAsync(async () => { var client = Client!; var updated = await client.RefreshCodeAsync(Lifetime); if (Client != client) return; _host ??= updated; _host.Code = updated.Code; _host.JoinLocked = updated.JoinLocked; _code.Text = updated.Code; }), "RefreshCode")));
+        }
         _qr = new Image { Width = 144, Height = 144, Margin = new Thickness(0, 24, 0, 20), Stretch = Stretch.Uniform }; AutomationProperties.SetAutomationId(_qr, "ConnectionQr"); panel.Children.Add(_qr);
         var urls = (_host?.LocalUrl is { Length: > 0 } local ? [local] : Array.Empty<string>())
             .Concat(_info?.Urls ?? [])
@@ -126,7 +138,7 @@ public sealed class MainWindow : AppWindow
             .Where(url => Uri.TryCreate(url, UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https")
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
-        if (_entry.Length == 0 && urls.Length > 0)
+        if (!urls.Contains(_entry, StringComparer.OrdinalIgnoreCase) && urls.Length > 0)
             _entry = urls.FirstOrDefault(url => !IsLoopbackUrl(url)) ?? Target;
         panel.Children.Add(Ui.Text("选择连接入口", 12, "Muted")); var menu = Ui.Menu(_entry, urls.Select(url => (url, (Action)(() => SelectConnectionEntry(url)))), "Entry"); _entryMenu = menu; menu.Margin = new Thickness(0, 6, 0, 8); panel.Children.Add(menu);
         var address = Ui.Input(_entry, "Address"); _address = address; address.IsReadOnly = true; address.Height = 34; address.BorderThickness = new Thickness(0); var copy = CreateCopyButton("", () => _entry, "CopyAddress", "地址已复制"); copy.Content = Ui.Icon("copy"); copy.Width = 34; copy.Padding = new Thickness(4); copy.BorderThickness = new Thickness(0); copy.ToolTip = L.T("复制地址"); var addressRow = new DockPanel(); DockPanel.SetDock(copy, Dock.Right); addressRow.Children.Add(copy); addressRow.Children.Add(address); var addressFrame = Ui.Border(addressRow, "Field", 0); addressFrame.Margin = new Thickness(0, 8, 0, 0); panel.Children.Add(addressFrame);
@@ -169,6 +181,7 @@ public sealed class MainWindow : AppWindow
     }
     private string GetHostStatusText()
     {
+        if (_host is null && Client?.Session is not null) return L.T("当前连接") + " · " + L.T(ConnectionLabel(Client));
         var configured = (_host?.PublicUrl ?? _info?.PublicUrl) is { Length: > 0 };
         return _host?.Internet switch
         {
@@ -208,8 +221,29 @@ public sealed class MainWindow : AppWindow
         await _loaded.Task;
         try
         {
-            SetClient(Target); _info = await Client!.InfoAsync(Lifetime);
-            if (_preferences.DeviceId.Length > 0 && _preferences.Server == Target) { var saved = await _settings.LoadAsync(Target, _preferences.DeviceId, Lifetime); if (saved?.SessionToken is { Length: > 0 } token) await Client.RestoreAsync(token, Lifetime); }
+            SetClient(Target);
+            var pending = await _handoff.LoadPendingAsync(Lifetime);
+            if (_preferences.DeviceId.Length > 0 && _preferences.Server == Target)
+            {
+                var saved = await _settings.LoadAsync(Target, _preferences.DeviceId, Lifetime);
+                if (saved?.Network is not null) Client!.UseNetwork(saved.Network);
+                if (saved?.SessionToken is { Length: > 0 } token)
+                {
+                    if (pending is not null) await Client!.RestoreHandoffControlAsync(token, pending.Outgoing || _preferences.Hosting == true ? new Uri(Target) : new Uri(pending.Source), Lifetime);
+                    else await Client!.RestoreAsync(token, Lifetime);
+                }
+            }
+            if (pending is not null && Client!.Session is not null)
+            {
+                if (_preferences.Hosting == true && !pending.Outgoing)
+                {
+                    Client.UseNetwork(await Client.HandoffApiAsync<GroupNetwork>("api/network", ct: Lifetime, host: true)); _host = await Client.HostAsync(Lifetime); _info = await Client.InfoAsync(Lifetime);
+                    if (Client.Network?.HostGeneration == pending.Offer.Generation && Client.Network.HostDeviceId == Client.Session.Device.Id && string.Equals(Path.GetFullPath(_options.DataDir), Path.GetFullPath(pending.DataDir), StringComparison.OrdinalIgnoreCase)) { await CompleteJoinAsync(); return; }
+                }
+                Build(); await _handoff.CheckIncomingAsync(Client, Lifetime);
+                if (await _handoff.LoadPendingAsync(Lifetime) is null && Client.Session is not null && _info is not null) return;
+            }
+            _info = await Client!.InfoAsync(Lifetime);
             try { _host = await Client.HostAsync(Lifetime); } catch (HttpRequestException) { }
             Build(); _ = RefreshHostStatusAsync(); await RefreshQrAsync();
             if (Client.Session is not null) await CompleteJoinAsync(); else if (_options.VerifyOutput is null) ShowJoin();
@@ -219,11 +253,14 @@ public sealed class MainWindow : AppWindow
     private void SetClient(string address)
     {
         var client = new LanClient(new Uri(address)); Client = client; Target = address;
+        client.RouteChanged += _ => Dispatcher.BeginInvoke(() => { if (Client == client) _status.Text = L.T(ConnectionLabel(client)); });
+        client.HostMoved += _ => Dispatcher.BeginInvoke(() => { if (Client == client) RenderDevices(); });
         client.PresenceChanged += _ => Dispatcher.BeginInvoke(() => { if (Client == client) RenderDevices(); });
         client.MessageReceived += message => Dispatcher.BeginInvoke(() => { if (Client != client || !_known.TryAdd(message.Id, message)) return; if (Matches(message)) AddVisible(message, true); else { var key = message.From == client.Session?.Device.Id ? message.To : message.From; _unread[key] = _unread.GetValueOrDefault(key) + 1; RenderDevices(); } });
         client.MessageHidden += id => Dispatcher.BeginInvoke(() => { if (Client != client) return; _known.Remove(id); var item = _messages.FirstOrDefault(view => view.Message.Id == id); if (item is not null) _messages.Remove(item); });
-        client.ConnectionChanged += state => Dispatcher.BeginInvoke(() => { if (Client != client) return; _status.Text = L.T(state == "connected" ? "已连接" : "连接中断，正在重连…"); if (state == "connected" && client.Session is not null && !_loading) _ = RunAsync(() => LoadHistoryAsync(false)); });
+        client.ConnectionChanged += state => Dispatcher.BeginInvoke(() => { if (Client != client) return; _status.Text = L.T(state == "connected" ? ConnectionLabel(client) : "连接中断，正在重连…"); if (state == "connected" && client.Session is not null && !_loading) _ = RunAsync(() => LoadHistoryAsync(false)); });
     }
+    private static string ConnectionLabel(LanClient client) => client.Network is null ? "已连接" : client.ActiveUri.IsLoopback ? "本机连接" : NetworkRoutes.IsPrivateLan(client.ActiveUri.AbsoluteUri) ? "局域网连接" : "互联网连接";
     private void ShowJoin()
     {
         var dialog = Dialog("连接你的设备"); var panel = new StackPanel { Margin = new Thickness(24) }; panel.Children.Add(Ui.Text("连接你的设备", 22));
@@ -246,11 +283,18 @@ public sealed class MainWindow : AppWindow
         }, "Join", true)); dialog.Content = panel; dialog.ShowDialog();
     }
     public async Task JoinForVerificationAsync(string name) { _host ??= await Client!.HostAsync(Lifetime); await Client!.JoinAsync(_host.Code, name, Guid.NewGuid().ToString("N"), Lifetime); await CompleteJoinAsync(); }
+    internal async Task JoinRemoteForVerificationAsync(string code, string name) { await Client!.JoinAsync(code, name, Guid.NewGuid().ToString("N"), Lifetime); await CompleteJoinAsync(); }
+    internal Task AdvertiseForVerificationAsync() => _handoff.AdvertiseAsync(Client!, Lifetime);
+    internal Task ReceiveHandoffForVerificationAsync() => _handoff.CheckIncomingAsync(Client!, Lifetime);
     private async Task CompleteJoinAsync()
     {
-        var session = Client!.Session!; await _settings.SaveAsync(new DesktopSettings { ServerUri = Target, DeviceId = session.Device.Id, Name = session.Device.Name, SessionToken = session.Token, AppDir = _options.AppDir, DataDir = _options.DataDir, Port = _options.Port }, Lifetime);
+        try { _host = await Client!.HostAsync(Lifetime); } catch (HttpRequestException) { _host = null; }
+        if (_host is not null && _info?.DesktopApi >= 3) await Client!.HandoffApiAsync<System.Text.Json.JsonElement>("api/host/owner", new { deviceId = Client.Session!.Device.Id }, true, Lifetime);
+        await Client!.RefreshNetworkAsync(Lifetime);
+        var session = Client.Session!; await _settings.SaveAsync(new DesktopSettings { ServerUri = Target, DeviceId = session.Device.Id, Name = session.Device.Name, SessionToken = session.Token, Network = Client.Network, AppDir = _options.AppDir, DataDir = _options.DataDir, Port = _options.Port }, Lifetime);
         _preferences.Server = Target; _preferences.DeviceId = session.Device.Id; _preferences.Save(_options.ClientDir);
-        try { _host = await Client.HostAsync(Lifetime); } catch (HttpRequestException) { _host = null; }
+        _preferences.Hosting = _host is not null; if (_preferences.Hosting == true) { _preferences.HostDataDir = _options.DataDir; _preferences.HostPort = _options.Port; } else await _backend.DisposeAsync(); _preferences.Save(_options.ClientDir);
+        if (Client.Network is not null && _options.VerifyOutput is null) { await _handoff.AdvertiseAsync(Client, Lifetime); _ = MonitorHandoffAsync(); }
         Build(); await Client.ConnectSocketAsync(Lifetime); await LoadHistoryAsync(false); await RefreshQrAsync();
     }
     private bool Matches(ChatMessage message) => _conversation == "all" ? message.To == "all" : message.To != "all" && (message.From == _conversation || message.To == _conversation);
@@ -260,12 +304,57 @@ public sealed class MainWindow : AppWindow
     private void RenderDevices()
     {
         _devices.Children.Clear(); AddDevice("all", L.T("公共聊天室"), L.T("发给所有在线设备"), "chat", true);
-        foreach (var device in Client?.Devices.OrderByDescending(item => item.Online).ThenBy(item => item.Name) ?? Enumerable.Empty<Device>()) AddDevice(device.Id, device.Name, L.T(device.Id == Client!.Session?.Device.Id ? "本机" : device.Online ? "在线" : "离线 · 可留言"), device.Type == DeviceType.Computer ? "computer" : "phone", device.Online); UpdateHeading();
+        foreach (var device in Client?.Devices.OrderByDescending(item => item.Online).ThenBy(item => item.Name) ?? Enumerable.Empty<Device>()) AddDevice(device.Id, device.Name, L.T(device.Id == Client!.Network?.HostDeviceId ? "服务主机" : device.Id == Client!.Session?.Device.Id ? "本机" : device.Online ? "在线" : "离线 · 可留言"), device.Type == DeviceType.Computer ? "computer" : "phone", device.Online); UpdateHeading();
     }
     private void AddDevice(string id, string name, string detail, string icon, bool online)
     {
         var labels = new StackPanel { Width = 112 }; var title = Ui.Text(name, 13); title.TextTrimming = TextTrimming.CharacterEllipsis; title.TextWrapping = TextWrapping.NoWrap; labels.Children.Add(title); labels.Children.Add(Ui.Text(detail, 11, "Muted")); var badge = _unread.GetValueOrDefault(id) > 0 ? _unread[id].ToString(System.Globalization.CultureInfo.InvariantCulture) : online ? "●" : "○";
         var button = Ui.Button("", () => SelectConversation(id), "Device-" + id); button.Content = Ui.Row(Ui.Icon(icon), labels, Ui.Text(badge, 10, online ? "Accent" : "Offline")); button.Height = 50; button.Padding = new Thickness(8); button.Margin = new Thickness(0, 0, 0, 7); button.SetResourceReference(Control.BackgroundProperty, _conversation == id ? "Selected" : "Rail"); _devices.Children.Add(button);
+        var device = Client?.Devices.FirstOrDefault(x => x.Id == id);
+        if (_host is not null && device is { Type: DeviceType.Computer } && id != Client?.Session?.Device.Id)
+        {
+            var menu = new ContextMenu(); var transfer = new MenuItem { Header = L.T("转移服务主机"), IsEnabled = online && device.CanHostVersion is not null && !_handoffBusy && !_busy };
+            transfer.ToolTip = L.T(device.CanHostVersion is null ? "目标电脑需要运行 1.2.0 或更新版本。" : "完整移交聊天、文件、设备身份和公网通道。");
+            transfer.Click += async (_, _) => await RunAsync(() => TransferHostAsync(id)); menu.Items.Add(transfer); button.ContextMenu = menu;
+        }
+    }
+    private async Task MonitorHandoffAsync()
+    {
+        var client = Client!;
+        while (!Lifetime.IsCancellationRequested && Client == client)
+        {
+            try { await Task.Delay(3000, Lifetime); if (Client != client) break; await _handoff.CheckIncomingAsync(client, Lifetime); if (!_handoffBusy && Client == client) await _handoff.AdvertiseAsync(client, Lifetime); }
+            catch (OperationCanceledException) when (Lifetime.IsCancellationRequested) { break; }
+            catch (Exception ex) when (ex is HttpRequestException or IOException or System.Security.Cryptography.CryptographicException or InvalidOperationException) { if (Client == client) _transfer.Text = L.T(ex.Message); }
+        }
+    }
+    public async Task TransferHostAsync(string deviceId)
+    {
+        if (_handoffBusy || _busy) throw new InvalidOperationException(L.T("仍有活动传输，暂不能移交。"));
+        _handoffBusy = true; RenderDevices();
+        try { await _handoff.TransferAsync(Client!, deviceId, _options.DataDir, Lifetime); }
+        finally { _handoffBusy = false; RenderDevices(); }
+    }
+    private async Task ActivateHostAsync(HandoffPending pending)
+    {
+        var old = Client!; var session = old.Session!;
+        var address = $"http://127.0.0.1:{pending.Offer.ReceivePort}";
+        if (_host is not null && string.Equals(Path.GetFullPath(_options.DataDir), Path.GetFullPath(pending.DataDir), StringComparison.OrdinalIgnoreCase) && old.Network?.HostGeneration == pending.Offer.Generation && old.Network.HostDeviceId == session.Device.Id) return;
+        _preferences.Hosting = true; _preferences.HostDataDir = pending.DataDir; _preferences.HostPort = pending.Offer.ReceivePort; _preferences.Server = address; _preferences.DeviceId = session.Device.Id;
+        await _settings.SaveAsync(new DesktopSettings { ServerUri = address, DeviceId = session.Device.Id, Name = session.Device.Name, SessionToken = session.Token, Network = old.Network, DataDir = pending.DataDir, Port = pending.Offer.ReceivePort }, Lifetime); _preferences.Save(_options.ClientDir);
+        _options.DataDir = pending.DataDir; _options.Port = pending.Offer.ReceivePort;
+        await _backend.StartAsync(_options.AppDir, pending.DataDir, _options.Port, _options.LocalOnly, Lifetime);
+        _previousHandoffClient = old;
+        SetClient(address); Client!.UseNetwork(old.Network!); await Client.RestoreAsync(session.Token, Lifetime); _info = await Client.InfoAsync(Lifetime); _host = await Client.HostAsync(Lifetime); _entry = "";
+        await CompleteJoinAsync();
+        // The handoff controller still needs the old authenticated client for the final activation acknowledgement.
+    }
+    private async Task DemoteHostAsync(GroupNetwork network)
+    {
+        var old = Client!; var session = old.Session!; var address = network.LanUrls.FirstOrDefault(value => NetworkRoutes.IsPrivateLan(value) && new Uri(value).Scheme == "https") ?? network.PublicUrl ?? throw new InvalidDataException("新主机没有可用连接入口。");
+        _preferences.Hosting = false; _preferences.Server = address; _preferences.DeviceId = session.Device.Id; _preferences.Save(_options.ClientDir);
+        await _backend.DisposeAsync(); SetClient(address); Client!.UseNetwork(network); await Client.RestoreAsync(session.Token, Lifetime); _info = await Client.InfoAsync(Lifetime); _host = null; _entry = "";
+        await CompleteJoinAsync(); await old.DisposeAsync();
     }
     public async Task LoadHistoryAsync(bool older = false)
     {
@@ -327,7 +416,7 @@ public sealed class MainWindow : AppWindow
     public async Task RunAsync(Func<Task> action) { try { await action(); _error.Visibility = Visibility.Collapsed; } catch (OperationCanceledException) when (Lifetime.IsCancellationRequested) { } catch (Exception ex) { ShowError(ex); } }
     private void ShowError(Exception ex) { _error.Text = L.T(ex.Message); _error.Visibility = Visibility.Visible; }
     public void RequestExit() { _exit = true; ExitRequested?.Invoke(); }
-    public async Task ShutdownAsync() { _exit = true; _lifetime.Cancel(); _copyFeedback?.Dispose(); if (Client is not null) await Client.DisposeAsync(); Close(); }
+    public async Task ShutdownAsync() { _exit = true; _lifetime.Cancel(); _copyFeedback?.Dispose(); if (Client is not null) await Client.DisposeAsync(); if (_previousHandoffClient is not null) await _previousHandoffClient.DisposeAsync(); await _handoff.DisposeAsync(); Close(); }
 }
 
 public sealed class MessageCard : Border

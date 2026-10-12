@@ -16,6 +16,12 @@ export type StoredSession = {
   deviceId: string;
   expiresAt: number;
 };
+export type NetworkIdentity = {
+  groupId: string;
+  publicKey: string;
+  privateKey: string;
+  hostGeneration: number;
+};
 export type History = {
   messages: Message[];
   hasMore: boolean;
@@ -48,9 +54,126 @@ export class Storage {
       CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, client_id TEXT, sender TEXT NOT NULL REFERENCES devices(id), recipient TEXT NOT NULL, text TEXT, created_at INTEGER NOT NULL, kind TEXT NOT NULL, file_id TEXT REFERENCES files(id) ON DELETE SET NULL);
       CREATE TABLE IF NOT EXISTS message_hides (message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE, device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE, hidden_at INTEGER NOT NULL, PRIMARY KEY(message_id, device_id));
       CREATE TABLE IF NOT EXISTS join_guard (id INTEGER PRIMARY KEY CHECK(id=1), failures INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS handoff_browser_tickets (hash TEXT PRIMARY KEY, session_hash TEXT NOT NULL, device_id TEXT NOT NULL, generation INTEGER NOT NULL, expires_at INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0);
       INSERT OR IGNORE INTO join_guard(id,failures) VALUES(1,0);
       CREATE INDEX IF NOT EXISTS messages_history ON messages(recipient, created_at, id);
       CREATE INDEX IF NOT EXISTS messages_client ON messages(sender, client_id);`);
+  }
+  loadOrCreateNetworkIdentity(): NetworkIdentity {
+    const rows = this.db
+      .prepare(
+        "SELECT key,value FROM metadata WHERE key IN ('network.groupId','network.publicKey','network.privateKey','network.hostGeneration')",
+      )
+      .all() as Array<{ key: string; value: string }>;
+    const values = new Map(rows.map((row) => [row.key, row.value]));
+    const existing = {
+      groupId: values.get('network.groupId'),
+      publicKey: values.get('network.publicKey'),
+      privateKey: values.get('network.privateKey'),
+      hostGeneration: Number(values.get('network.hostGeneration')),
+    };
+    if (
+      typeof existing.groupId === 'string' &&
+      existing.groupId.length > 0 &&
+      typeof existing.publicKey === 'string' &&
+      existing.publicKey.length > 0 &&
+      typeof existing.privateKey === 'string' &&
+      existing.privateKey.length > 0
+    ) {
+      const generation =
+        Number.isSafeInteger(existing.hostGeneration) &&
+        existing.hostGeneration >= 1
+          ? existing.hostGeneration
+          : 1;
+      if (generation !== existing.hostGeneration)
+        this.db
+          .prepare(
+            "INSERT OR REPLACE INTO metadata(key,value) VALUES('network.hostGeneration',?)",
+          )
+          .run(String(generation));
+      return {
+        groupId: existing.groupId,
+        publicKey: existing.publicKey,
+        privateKey: existing.privateKey,
+        hostGeneration: generation,
+      };
+    }
+    const pair = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+    const identity: NetworkIdentity = {
+      groupId: crypto.randomUUID(),
+      publicKey: pair.publicKey
+        .export({ type: 'spki', format: 'der' })
+        .toString('base64'),
+      privateKey: pair.privateKey
+        .export({ type: 'pkcs8', format: 'der' })
+        .toString('base64'),
+      hostGeneration: 1,
+    };
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const [key, value] of Object.entries(identity))
+        this.db
+          .prepare('INSERT OR REPLACE INTO metadata(key,value) VALUES(?,?)')
+          .run(`network.${key}`, value);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+    return identity;
+  }
+  getMetadata(key: string): string | undefined {
+    const row = this.db
+      .prepare('SELECT value FROM metadata WHERE key=?')
+      .get(key) as { value?: unknown } | undefined;
+    return typeof row?.value === 'string' ? row.value : undefined;
+  }
+  setMetadata(key: string, value: string) {
+    this.db
+      .prepare('INSERT OR REPLACE INTO metadata(key,value) VALUES(?,?)')
+      .run(key, value);
+  }
+  setMetadataMany(entries: ReadonlyArray<readonly [string, string]>) {
+    const write = this.db.prepare(
+      'INSERT OR REPLACE INTO metadata(key,value) VALUES(?,?)',
+    );
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const [key, value] of entries) write.run(key, value);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+  snapshotInto(filePath: string) {
+    const target = filePath.replace(/'/g, "''");
+    this.db.exec(`VACUUM INTO '${target}'`);
+  }
+  patchSnapshotHandoff(
+    filePath: string,
+    generation: number,
+    ownerDeviceId: string,
+  ) {
+    const snapshot = new DatabaseSync(filePath);
+    try {
+      snapshot.exec('BEGIN IMMEDIATE');
+      try {
+        const write = snapshot.prepare(
+          'INSERT OR REPLACE INTO metadata(key,value) VALUES(?,?)',
+        );
+        write.run('network.hostGeneration', String(generation));
+        write.run('host.deviceId', ownerDeviceId);
+        snapshot.prepare("DELETE FROM metadata WHERE key='host.retired'").run();
+        snapshot.exec('COMMIT');
+      } catch (error) {
+        snapshot.exec('ROLLBACK');
+        throw error;
+      }
+    } finally {
+      snapshot.close();
+    }
   }
   close() {
     this.db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
@@ -143,6 +266,52 @@ export class Storage {
   }
   deleteSession(hash: string) {
     this.db.prepare('DELETE FROM sessions WHERE hash=?').run(hash);
+  }
+  saveHandoffBrowserTicket(
+    hash: string,
+    sessionHash: string,
+    deviceId: string,
+    generation: number,
+    expiresAt: number,
+  ) {
+    this.db
+      .prepare(
+        'INSERT OR REPLACE INTO handoff_browser_tickets(hash,session_hash,device_id,generation,expires_at,used) VALUES(?,?,?,?,?,0)',
+      )
+      .run(hash, sessionHash, deviceId, generation, expiresAt);
+  }
+  consumeHandoffBrowserTicket(hash: string, generation: number) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const row = this.db
+        .prepare(
+          'SELECT session_hash,device_id FROM handoff_browser_tickets WHERE hash=? AND generation=? AND used=0 AND expires_at>? ',
+        )
+        .get(hash, generation, Date.now()) as
+        { session_hash: string; device_id: string } | undefined;
+      if (!row) {
+        this.db.exec('ROLLBACK');
+        return undefined;
+      }
+      this.db
+        .prepare('UPDATE handoff_browser_tickets SET used=1 WHERE hash=?')
+        .run(hash);
+      this.db.exec('COMMIT');
+      return { sessionHash: row.session_hash, deviceId: row.device_id };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+  deleteHandoffBrowserTickets(generation: number) {
+    this.db
+      .prepare('DELETE FROM handoff_browser_tickets WHERE generation=?')
+      .run(generation);
+  }
+  deleteHandoffBrowserTicketsAfter(generation: number) {
+    this.db
+      .prepare('DELETE FROM handoff_browser_tickets WHERE generation>?')
+      .run(generation);
   }
   joinFailures(): number {
     const row = this.db

@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Download, X } from 'lucide-react';
 import type { Message } from '../types';
 import { isPhoneBrowser } from '../media';
+import { networkFetch } from '../network';
 
 export function SaveToPhone({ file }: { file: NonNullable<Message['file']> }) {
   const { t } = useTranslation();
@@ -50,7 +51,7 @@ export function SaveToPhone({ file }: { file: NonNullable<Message['file']> }) {
           }
           setBusy(true);
           try {
-            const response = await fetch(`${base}/media`, {
+            const response = await networkFetch(`${base}/media`, {
               signal: AbortSignal.timeout(60000),
             });
             if (!response.ok)

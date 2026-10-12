@@ -69,17 +69,17 @@ internal static class NativeVerification
             window.ChangeAppearance("zh", theme); window.UpdateLayout(); await Task.Delay(120);
             window.Activate(); var language = Find<Button>(window, "Language")!; language.Focus(); language.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); await Task.Delay(120); var menu = language.ContextMenu!; menu.UpdateLayout();
             foreach (var item in menu.Items.OfType<MenuItem>()) { var flag = ((Panel)item.Header).Children.OfType<Image>().Single(); var top = flag.TranslatePoint(new Point(), item).Y; Assert(flag.ActualWidth == 22 && flag.ActualHeight == 22 && top >= 8 && top + 22 <= item.ActualHeight - 8, "uncropped language flags"); }
-            var focusedLanguage = menu.Items.OfType<MenuItem>().First(); var focusAccepted = focusedLanguage.Focus(); await Task.Delay(80); Assert(focusedLanguage.IsKeyboardFocused && ((SolidColorBrush)focusedLanguage.Background).Color == ((SolidColorBrush)Ui.Brush("Selected")).Color, $"dropdown keyboard highlight uses shared theme token; focusAccepted={focusAccepted}, focused={focusedLanguage.IsKeyboardFocused}, highlighted={focusedLanguage.IsHighlighted}, background={focusedLanguage.Background}, expected={Ui.Brush("Selected")}, menuOpen={menu.IsOpen}, active={window.IsActive}");
+            var focusedLanguage = menu.Items.OfType<MenuItem>().First(); await window.Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.ContextIdle); var focusAccepted = focusedLanguage.Focus(); System.Windows.Input.Keyboard.Focus(focusedLanguage); await WaitAsync(() => focusedLanguage.IsKeyboardFocused); Assert(((SolidColorBrush)focusedLanguage.Background).Color == ((SolidColorBrush)Ui.Brush("Selected")).Color, $"dropdown keyboard highlight uses shared theme token; focusAccepted={focusAccepted}, focused={focusedLanguage.IsKeyboardFocused}, highlighted={focusedLanguage.IsHighlighted}, background={focusedLanguage.Background}, expected={Ui.Brush("Selected")}, menuOpen={menu.IsOpen}, active={window.IsActive}");
             NativeWindowCapture.Save(menu, Path.Combine(directory, "native-language-" + theme + ".png")); menu.IsOpen = false;
             _ = window.Dispatcher.BeginInvoke(() => Find<Button>(window, "Settings")!.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)));
             await WaitAsync(() => Application.Current.Windows.OfType<AppWindow>().Any(dialog => dialog != window && dialog.Title == L.T("设备设置")));
-            var settingsDialog = Application.Current.Windows.OfType<AppWindow>().Single(dialog => dialog != window && dialog.Title == L.T("设备设置")); await Task.Delay(120); Assert(Find<Button>(settingsDialog, "WindowMinimize")!.Visibility == Visibility.Collapsed, "dialog caption only close"); Assert(NativeWindowCapture.HasExpectedCorners(settingsDialog), "settings rounded frame"); Screenshot(settingsDialog, Path.Combine(directory, "native-settings-" + theme + ".png"));
+            var settingsDialog = Application.Current.Windows.OfType<AppWindow>().Single(dialog => dialog != window && dialog.Title == L.T("设备设置")); await WaitForCornersAsync(settingsDialog); Assert(Find<Button>(settingsDialog, "WindowMinimize")!.Visibility == Visibility.Collapsed, "dialog caption only close"); Assert(NativeWindowCapture.HasExpectedCorners(settingsDialog), "settings rounded frame"); Screenshot(settingsDialog, Path.Combine(directory, "native-settings-" + theme + ".png"));
             _ = window.Dispatcher.BeginInvoke(() => Find<Button>(settingsDialog, "SwitchHost")!.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)));
             await WaitAsync(() => Application.Current.Windows.OfType<AppWindow>().Any(dialog => dialog != window && dialog.Title == L.T("连接你的设备")));
-            var joinDialog = Application.Current.Windows.OfType<AppWindow>().Single(dialog => dialog != window && dialog.Title == L.T("连接你的设备")); await Task.Delay(120); Assert(NativeWindowCapture.HasExpectedCorners(joinDialog), "join dialog rounded frame"); Screenshot(joinDialog, Path.Combine(directory, "native-connect-" + theme + ".png")); Find<Button>(joinDialog, "WindowClose")!.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            var joinDialog = Application.Current.Windows.OfType<AppWindow>().Single(dialog => dialog != window && dialog.Title == L.T("连接你的设备")); await WaitForCornersAsync(joinDialog); Assert(NativeWindowCapture.HasExpectedCorners(joinDialog), "join dialog rounded frame"); Screenshot(joinDialog, Path.Combine(directory, "native-connect-" + theme + ".png")); Find<Button>(joinDialog, "WindowClose")!.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
             _ = window.Dispatcher.BeginInvoke(async () => await window.HideMessageAsync(sent));
             await WaitAsync(() => Application.Current.Windows.OfType<AppWindow>().Any(dialog => dialog != window && dialog.Title == L.T("仅从本设备删除")));
-            var confirmation = Application.Current.Windows.OfType<AppWindow>().Single(dialog => dialog != window && dialog.Title == L.T("仅从本设备删除")); await Task.Delay(120); Assert(NativeWindowCapture.HasExpectedCorners(confirmation), "confirmation rounded frame"); Screenshot(confirmation, Path.Combine(directory, "native-confirm-" + theme + ".png")); Find<Button>(confirmation, "ConfirmCancel")!.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); Assert((await native.HistoryAsync()).Messages.Any(message => message.Id == sent.Id), "cancel deletion retains message");
+            var confirmation = Application.Current.Windows.OfType<AppWindow>().Single(dialog => dialog != window && dialog.Title == L.T("仅从本设备删除")); await WaitForCornersAsync(confirmation); Assert(NativeWindowCapture.HasExpectedCorners(confirmation), "confirmation rounded frame"); Screenshot(confirmation, Path.Combine(directory, "native-confirm-" + theme + ".png")); Find<Button>(confirmation, "ConfirmCancel")!.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); Assert((await native.HistoryAsync()).Messages.Any(message => message.Id == sent.Id), "cancel deletion retains message");
         }
         Assert(Find<Button>(window, "AddDevice") is null && Find<Button>(window, "ConnectOther") is null, "duplicate connection entry points removed"); checks.Add("Actual native captions and dialogs match theme / four uncropped round flags / single connection panel");
         Assert(NativeWindowCapture.HasExpectedCorners(window), "main window rounded frame"); Assert(NativeWindowCapture.HitTest(window, new Point(window.ActualWidth / 2, 16)) == 2, "native draggable caption hit test"); Assert(NativeWindowCapture.HitTest(window, new Point(2, window.ActualHeight / 2)) == 10, "native left resize edge hit test"); Find<Button>(window, "WindowMaximize")!.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); await Task.Delay(160); Assert(window.WindowState == WindowState.Maximized && NativeWindowCapture.HasExpectedCorners(window), "caption maximize with full rectangular work area"); Screenshot(window, Path.Combine(directory, "native-maximized.png")); Assert(NativeWindowCapture.FitsWorkArea(window, Find<Button>(window, "Send")!), "maximized composer remains within monitor work area"); Find<Button>(window, "WindowMaximize")!.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); await Task.Delay(120); Assert(window.WindowState == WindowState.Normal && NativeWindowCapture.HasExpectedCorners(window), "caption restore reinstates rounded corners"); Find<Button>(window, "WindowMinimize")!.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); await Task.Delay(120); Assert(window.WindowState == WindowState.Minimized, "caption minimize"); System.Windows.SystemCommands.RestoreWindow(window); await Task.Delay(120); checks.Add("Rounded main/media/dialog windows / maximize resets corners / restore reinstates rounding / native drag and resize hit tests");
@@ -100,10 +100,72 @@ internal static class NativeVerification
         VerifyCopy(window, Find<Button>(window, "CopyAddress")!, Find<TextBox>(window, "Address")!.Text, "地址已复制");
         VerifyCopy(window, Find<Button>(window, "CopyCode")!, (await native.HostAsync()).Code, "连接码已复制");
         await VerifyCopyFeedbackAsync(window, sent, directory); checks.Add("Copy feedback: actual clipboard / all copy entries / four languages and themes / stable width and focus / rapid repeat and reset / empty and clipboard failure");
+        await VerifyHostHandoffAsync(window, options, phone, stranger, sent, incoming, privateMessage, directory); checks.Add("Two actual WPF clients / right-click full encrypted host transfer / sealed receiver restart / source demotion / group and device identities / private ACL and hidden history / 9 MiB SHA256 / synthetic tunnel credential re-protection / new-host address and QR on both clients");
         await Task.Delay(300); GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect(); await Task.Delay(200);
         await File.WriteAllTextAsync(options.VerifyOutput!, JsonSerializer.Serialize(new { passed = true, checks, elapsedMs = watch.ElapsedMilliseconds, initialWorkingSetBytes, peakWorkingSetBytes, afterQaGcWorkingSetBytes = Process.GetCurrentProcess().WorkingSet64, nativeWpf = true, browserOrWebView = false, packagedProcess = NativeWindowCapture.IsPackagedProcess }, new JsonSerializerOptions { WriteIndented = true }));
     }
     private static void Photo(string file, Color color) { var visual = new DrawingVisual(); using (var context = visual.RenderOpen()) { context.DrawRectangle(new SolidColorBrush(color), null, new Rect(0, 0, 640, 360)); } var bitmap = new RenderTargetBitmap(640, 360, 96, 96, PixelFormats.Pbgra32); bitmap.Render(visual); var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(bitmap)); using var stream = File.Create(file); encoder.Save(stream); }
+    private static async Task WaitForCornersAsync(AppWindow window)
+    {
+        window.UpdateLayout(); await window.Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.ContextIdle);
+        await WaitAsync(() => NativeWindowCapture.HasExpectedCorners(window));
+    }
+    private static async Task VerifyHostHandoffAsync(MainWindow source, DesktopOptions options, LanClient phone, LanClient stranger, ChatMessage publicMessage, ChatMessage hiddenMessage, ChatMessage privateMessage, string directory)
+    {
+        void Stage(string message) => File.AppendAllText(options.VerifyOutput + ".progress", DateTime.UtcNow.ToString("O") + " " + message + Environment.NewLine);
+        Stage("Starting full WPF host transfer");
+        var original = source.Client!; var network = original.Network!; var sourceId = original.Session!.Device.Id;
+        var host = await original.HostAsync(); var lan = (await original.InfoAsync()).Urls.First(value => NetworkRoutes.IsPrivateHttp(value));
+        var targetRoot = Path.Combine(Path.GetDirectoryName(options.ClientDir)!, "migration-target"); ManagedPaths.Create(targetRoot);
+        var targetOptions = new DesktopOptions { AppDir = Path.Combine(targetRoot, "app"), DataDir = Path.Combine(targetRoot, "data"), StorageRoot = Path.Combine(targetRoot, "data"), ClientDir = Path.Combine(targetRoot, "desktop"), ServerUri = lan, VerifyOutput = options.VerifyOutput, LocalOnly = true };
+        for (var attempt = 0; ; attempt++) { var port = new System.Net.Sockets.TcpListener(IPAddress.Any, 0); port.Start(); targetOptions.Port = ((IPEndPoint)port.LocalEndpoint).Port; var securePort = new System.Net.Sockets.TcpListener(IPAddress.Any, targetOptions.Port == 65535 ? 65534 : targetOptions.Port + 1); try { securePort.Start(); break; } catch (System.Net.Sockets.SocketException) when (attempt < 10) { } finally { securePort.Stop(); port.Stop(); } }
+        ManagedPaths.Create(targetOptions.ClientDir); await using var targetBackend = new BackendHost(); var target = new MainWindow(targetOptions, targetBackend);
+        using var receiving = new CancellationTokenSource(TimeSpan.FromSeconds(90)); Task? receiver = null;
+        var fakeToken = System.Text.Encoding.UTF8.GetBytes("synthetic-qa-token-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            await File.WriteAllBytesAsync(Path.Combine(options.DataDir, "tunnel-token.dpapi"), ProtectedData.Protect(fakeToken, null, DataProtectionScope.CurrentUser));
+            target.Show(); await target.ReadyTask; await target.JoinRemoteForVerificationAsync(host.Code, "Target PC QA"); await target.AdvertiseForVerificationAsync();
+            Stage("Target joined and advertised");
+            var targetId = target.Client!.Session!.Device.Id; await WaitAsync(() => original.Devices.Any(device => device.Id == targetId && device.CanHostVersion is not null));
+            var file = (await original.HistoryAsync(phone.Session!.Device.Id)).Messages.First(message => message.File?.Name == "qa-chunks.bin").File!;
+            var hash = SHA256.HashData(await original.GetBytesAsync("api/files/" + file.Id, 12 * 1024 * 1024));
+            receiver = ReceiveAsync();
+            var menu = Find<Button>(source, "Device-" + targetId)!.ContextMenu!; var transfer = menu.Items.OfType<MenuItem>().Single(); Assert(transfer.IsEnabled && (string)transfer.Header == L.T("转移服务主机"), "host transfer context command");
+            transfer.RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
+            Stage("Context command invoked");
+            var deadline = DateTime.UtcNow.AddSeconds(90);
+            var previousProgress = "";
+            while (source.Client == original || source.HostTransferBusy) { var progress = source.VerificationHandoffProgress + " / " + target.VerificationHandoffProgress; if (progress != previousProgress) { Stage(progress); previousProgress = progress; } if (receiver.IsFaulted) await receiver; if (!source.HostTransferBusy && source.VerificationError.Length > 0) throw new InvalidOperationException(source.VerificationError); if (DateTime.UtcNow > deadline) throw new TimeoutException("WPF host migration timed out: " + source.VerificationError); await Task.Delay(100); }
+            Stage("Source demoted");
+            await receiver; receiving.Cancel();
+            var newNetwork = target.Client!.Network!; Assert(newNetwork.GroupId == network.GroupId && newNetwork.PublicKey == network.PublicKey && newNetwork.HostGeneration == network.HostGeneration + 1 && newNetwork.HostDeviceId == targetId, "same group and monotonic host generation");
+            Assert(source.Client!.Session!.Device.Id == sourceId && !source.Client.ActiveUri.IsLoopback && source.Client.ActiveUri.Scheme == "https", "old host demoted to pinned TLS client");
+            phone.UseNetwork(newNetwork); stranger.UseNetwork(newNetwork); await phone.RefreshNetworkAsync(); await stranger.RefreshNetworkAsync(); await phone.ConnectSocketAsync();
+            Assert((await source.Client.HistoryAsync()).Messages.Any(message => message.Id == publicMessage.Id), "public chat migrated");
+            Assert(!(await source.Client.HistoryAsync()).Messages.Any(message => message.Id == hiddenMessage.Id) && (await phone.HistoryAsync()).Messages.Any(message => message.Id == hiddenMessage.Id), "per-device hidden history migrated");
+            Assert((await phone.HistoryAsync(sourceId)).Messages.Any(message => message.Id == privateMessage.Id) && !(await stranger.HistoryAsync(sourceId)).Messages.Any(message => message.Id == privateMessage.Id), "migrated private ACL");
+            Assert(SHA256.HashData(await phone.GetBytesAsync("api/files/" + file.Id, 12 * 1024 * 1024)).SequenceEqual(hash), "migrated binary SHA256");
+            var protectedToken = await File.ReadAllBytesAsync(Path.Combine(targetOptions.DataDir, "tunnel-token.dpapi")); var plain = ProtectedData.Unprotect(protectedToken, null, DataProtectionScope.CurrentUser);
+            try { Assert(plain.SequenceEqual(fakeToken) && !protectedToken.SequenceEqual(fakeToken), "tunnel token decrypted then re-protected on destination"); } finally { CryptographicOperations.ZeroMemory(plain); }
+            Assert(!File.Exists(Path.Combine(options.ClientDir, "handoff-pending.json")) && !File.Exists(Path.Combine(targetOptions.ClientDir, "handoff-pending.json")), "completed migration clears pending states");
+            var targetEntry = Find<TextBox>(target, "Address")!.Text; var sourceEntry = Find<TextBox>(source, "Address")!.Text;
+            Assert(new Uri(targetEntry).Port == targetOptions.Port && sourceEntry == targetEntry, "both connection panels point to the new host");
+            Assert(Find<Button>(source, "CopyCode") is null && Find<Button>(source, "RefreshCode") is null && Find<Button>(target, "CopyCode") is not null, "only the service host offers code management");
+            await VerifyQrAsync(target, target.Client!, targetEntry); await VerifyQrAsync(source, source.Client!, sourceEntry);
+            await source.SendTextAsync("After handoff → new host"); await WaitAsync(() => target.Messages.Any(view => view.Message.Text == "After handoff → new host"));
+            Screenshot(target, Path.Combine(directory, "native-handoff-new-host.png")); Screenshot(source, Path.Combine(directory, "native-handoff-old-client.png"));
+            async Task ReceiveAsync()
+            {
+                // Recreate the target after sealing to exercise persistent identity/key recovery.
+                while (true) { try { if ((await target.Client!.HandoffApiAsync<HandoffInbox>("api/handoff/inbox", ct: receiving.Token)).Offer?.State == "sealed") break; } catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.NotFound) { } await Task.Delay(300, receiving.Token); }
+                await target.ShutdownAsync(); target = new MainWindow(targetOptions, targetBackend); target.Show(); await target.ReadyTask;
+                Assert(target.Client!.Session?.Device.Id == targetId, "receiver restart preserves target identity"); Stage("Sealed receiver restarted with DPAPI key");
+                while (!receiving.IsCancellationRequested) { await target.ReceiveHandoffForVerificationAsync(); if (target.Client!.ActiveUri.IsLoopback && target.Client.Network?.HostGeneration == network.HostGeneration + 1) return; await target.AdvertiseForVerificationAsync(); await Task.Delay(300, receiving.Token); }
+            }
+        }
+        finally { receiving.Cancel(); var shutdown = target.ShutdownAsync(); if (receiver is not null) { try { await receiver; } catch (OperationCanceledException) { } } await shutdown; CryptographicOperations.ZeroMemory(fakeToken); }
+    }
     private sealed class VerificationUpdateHandler(Version version) : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)

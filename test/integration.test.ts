@@ -464,7 +464,7 @@ test('二维码只接受自身 URL 且返回 SVG', async (t) => {
     desktopApi: number;
   };
   assert.ok(info.urls.length > 0);
-  assert.equal(info.desktopApi, 2);
+  assert.equal(info.desktopApi, 3);
   const qr = await fetch(
     `${x.base}/api/qr?url=${encodeURIComponent(info.urls[0])}`,
   );

@@ -31,6 +31,7 @@ $runRoot = Join-Path $evidenceRoot ('.run-' + [Guid]::NewGuid().ToString('N'))
 $shortcut = Join-Path $evidenceRoot ('.native-qa-' + [Guid]::NewGuid().ToString('N') + '.lnk')
 $report = Join-Path $evidenceRoot 'verification.json'
 $pidFile = $report + '.pid'
+$progressFile = $report + '.progress'
 $packaged = [NativePackageContext]::IsPackaged()
 $qaPid = $null
 $launch = $null
@@ -71,9 +72,17 @@ New-Item -ItemType Directory -Path $qaDataDir -Force | Out-Null
 $candidateHash = (Get-FileHash -LiteralPath $Exe -Algorithm SHA256).Hash.ToLowerInvariant()
 if (Test-Path -LiteralPath $report) { Assert-CleanupPath $report $evidenceRoot; Remove-Item -LiteralPath $report -Force }
 if (Test-Path -LiteralPath $pidFile) { Assert-CleanupPath $pidFile $evidenceRoot; Remove-Item -LiteralPath $pidFile -Force }
+if (Test-Path -LiteralPath $progressFile) { Assert-CleanupPath $progressFile $evidenceRoot; Remove-Item -LiteralPath $progressFile -Force }
 Assert-NoReparsePath $runRoot
-$portListener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
-$portListener.Start(); $port = $portListener.LocalEndpoint.Port; $portListener.Stop()
+for ($attempt = 0; ; $attempt++) {
+  $portListener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Any, 0)
+  $portListener.Start(); $port = $portListener.LocalEndpoint.Port
+  $tlsPort = if ($port -eq 65535) { 65534 } else { $port + 1 }
+  $tlsListener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Any, $tlsPort)
+  try { $tlsListener.Start(); break }
+  catch [Net.Sockets.SocketException] { if ($attempt -ge 10) { throw } }
+  finally { $tlsListener.Stop(); $portListener.Stop() }
+}
 $qaArguments = @('--app-dir', (Join-Path $runRoot 'app'), '--data-dir', (Join-Path $runRoot 'data'), '--client-dir', (Join-Path $runRoot 'desktop'), '--port', [string]$port, '--local', '--verify', $report)
 $argumentText = ($qaArguments | ForEach-Object { Quote-Argument $_ }) -join ' '
 
@@ -104,6 +113,8 @@ try {
     }
     if ($earlyFailure -and $earlyFailure.PSObject.Properties.Name -contains 'passed' -and $earlyFailure.passed -eq $false) {
       Get-Content -LiteralPath $report
+      $startupError = Join-Path $qaDataDir 'native-backend.stderr.log'
+      if (Test-Path -LiteralPath $startupError) { Get-Content -LiteralPath $startupError -Tail 30 }
       throw '原生客户端回归未通过。'
     }
     if (!$qaPid -and (Test-Path -LiteralPath $pidFile)) {
@@ -124,6 +135,7 @@ try {
   $result | Add-Member -NotePropertyName artifactSha256 -NotePropertyValue $candidateHash
   $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $report -Encoding UTF8
   Get-Content -LiteralPath $report
+  if (Test-Path -LiteralPath $progressFile) { Assert-CleanupPath $progressFile $evidenceRoot; Remove-Item -LiteralPath $progressFile -Force }
 } finally {
   if ($qaPid) { Stop-OwnedQaProcess $qaPid $Exe $report }
   if (Test-Path -LiteralPath $pidFile) { Assert-CleanupPath $pidFile $evidenceRoot; Remove-Item -LiteralPath $pidFile -Force }

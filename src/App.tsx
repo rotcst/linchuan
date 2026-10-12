@@ -13,6 +13,12 @@ import { Chat } from './components/Chat';
 import { Brand } from './components/Brand';
 import { ThemeSelector } from './components/ThemeSelector';
 import { LanguageSelector } from './components/LanguageSelector';
+import {
+  bridgeToPublic,
+  receiveBrowserTicket,
+  resetNetwork,
+  startNetwork,
+} from './network';
 
 function Workspace({
   session: initialSession,
@@ -68,7 +74,9 @@ function Workspace({
             <span
               className={`presence-dot ${lan.connection === 'connected' ? 'online' : ''}`}
             />
-            {lan.connection === 'connected' ? t('已连接') : t('正在连接…')}
+            {lan.connection === 'connected'
+              ? t(lan.network === 'lan' ? '局域网连接' : '互联网连接')
+              : t('正在连接…')}
           </span>
           <LanguageSelector />
           <ThemeSelector />
@@ -266,6 +274,7 @@ export default function App() {
   const [loadAttempt, setLoadAttempt] = useState(0);
   const leave = useCallback((reason = '') => {
     localStorage.removeItem(TOKEN_KEY);
+    resetNetwork();
     setSession(null);
     setError(reason);
   }, []);
@@ -275,11 +284,27 @@ export default function App() {
     setError('');
     const initialize = async () => {
       try {
+        const bridged = (await receiveBrowserTicket()) as Session | null;
+        if (bridged) {
+          localStorage.setItem(TOKEN_KEY, bridged.token);
+          localStorage.setItem(
+            PROFILE_KEY,
+            JSON.stringify({
+              deviceId: bridged.device.id,
+              name: bridged.device.name,
+              type: bridged.device.type,
+            }),
+          );
+        }
         const serverInfo = await api<ServerInfo>('/api/info');
         if (!active) return;
         setInfo(serverInfo);
         try {
-          const restored = await restoreSession();
+          const restored = bridged || (await restoreSession());
+          if (restored) {
+            await startNetwork(restored.token);
+            if (await bridgeToPublic(restored.token)) return;
+          }
           if (active) setSession(restored);
         } catch (cause) {
           if ((cause as { status?: number }).status === 401)
@@ -323,7 +348,12 @@ export default function App() {
     return (
       <JoinScreen
         onJoin={(joined) => {
-          setSession(joined);
+          resetNetwork();
+          void startNetwork(joined.token)
+            .then(async () => {
+              if (!(await bridgeToPublic(joined.token))) setSession(joined);
+            })
+            .catch(() => setSession(joined));
           setError('');
         }}
         initialError={localizeNotice(error)}

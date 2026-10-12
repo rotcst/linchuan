@@ -16,6 +16,12 @@ public static class App
         try
         {
             var options = DesktopOptions.Parse(args);
+            var startupPreferences = Preferences.Load(options.ClientDir);
+            if (options.VerifyOutput is null && options.ServerUri is null)
+            {
+                if (startupPreferences.Hosting == false && startupPreferences.Server.Length > 0) options.ServerUri = startupPreferences.Server;
+                else if (startupPreferences.Hosting == true && startupPreferences.HostDataDir.Length > 0) { ManagedPaths.Check(startupPreferences.HostDataDir); options.DataDir = startupPreferences.HostDataDir; if (!options.PortSpecified && startupPreferences.HostPort is >= 1024 and <= 65535) options.Port = startupPreferences.HostPort; }
+            }
             var identity = Path.GetFullPath(options.ClientDir).ToLowerInvariant() + "|" + options.Port;
             var name = "Linchuan.Desktop." + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)))[..24];
             using var mutex = new Mutex(true, "Local\\" + name, out var owner);
@@ -31,7 +37,7 @@ public static class App
             {
                 try
                 {
-                    L.Set(Preferences.Load(options.ClientDir).Language);
+                    var saved = Preferences.Load(options.ClientDir); L.Set(saved.Language);
                     if (options.ServerUri is null) await host.StartAsync(options.AppDir, options.DataDir, options.Port, options.LocalOnly, life.Token);
                     window = new MainWindow(options, host); application.MainWindow = window; window.ExitRequested += async () => await StopAsync(); window.Show();
                     if (options.VerifyOutput is not null) { await NativeVerification.RunAsync(window, options); await StopAsync(); return; }

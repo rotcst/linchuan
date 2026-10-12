@@ -32,6 +32,8 @@ internal static class Program
             await ReuseRequiresMatchingPublicUrlAsync(root);
             await UpdateCheckerValidationAsync();
             await NativeRequestIdentityAsync();
+            HostTransferCryptography();
+            HostTransferRestartRecovery(root);
             Assert(new UploadProgress { UploadedBytes = 20, TotalBytes = 10 }.Percent == 100, "上传进度上限");
             Assert(new UploadProgress { UploadedBytes = -1, TotalBytes = 10 }.Percent == 0, "上传进度下限");
             Assert(new UploadProgress { UploadedBytes = long.MaxValue, TotalBytes = long.MaxValue }.Percent == 100, "大整数进度");
@@ -68,6 +70,53 @@ internal static class Program
         Assert((await invalidChecker.CheckAsync()).Status == UpdateStatus.NetworkError, "malformed metadata is not an up-to-date result");
     }
 
+    private static void HostTransferCryptography()
+    {
+        using var keyPair = RSA.Create(2048);
+        var group = new GroupNetwork { Protocol = 1, GroupId = Guid.NewGuid().ToString(), PublicKey = Convert.ToBase64String(keyPair.ExportSubjectPublicKeyInfo()), HostGeneration = 1 };
+        using var routes = new NetworkRoutes(new Uri("https://transfer.example.test")); routes.Pin(group);
+        var rejected = false; try { routes.Pin(new GroupNetwork { Protocol = 1, GroupId = group.GroupId, PublicKey = group.PublicKey, HostGeneration = 0 }); } catch (InvalidDataException) { rejected = true; } Assert(rejected, "主机代次不能倒退");
+        var certificateRequest = new System.Security.Cryptography.X509Certificates.CertificateRequest("CN=fixture", keyPair, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        using var certificate = certificateRequest.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-1), DateTimeOffset.UtcNow.AddHours(1));
+        Assert(NetworkRoutes.ValidateCertificate(new Uri("https://192.168.31.84:3940"), certificate, System.Net.Security.SslPolicyErrors.RemoteCertificateChainErrors, group), "局域网TLS匹配组公钥");
+        using var foreign = RSA.Create(2048); using var foreignCert = new System.Security.Cryptography.X509Certificates.CertificateRequest("CN=foreign", foreign, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1).CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-1), DateTimeOffset.UtcNow.AddHours(1));
+        Assert(!NetworkRoutes.ValidateCertificate(new Uri("https://192.168.31.84:3940"), foreignCert, System.Net.Security.SslPolicyErrors.None, group), "局域网TLS陌生证书即使有效也拒绝");
+        Assert(!NetworkRoutes.ValidateCertificate(new Uri("https://transfer.example.test"), certificate, System.Net.Security.SslPolicyErrors.RemoteCertificateChainErrors, group), "公网不能绕过证书链验证");
+        var offer = new HandoffOffer { Id = Guid.NewGuid().ToString("N"), GroupId = group.GroupId, Generation = 2, TargetDeviceId = "target-fixture", ReceivePort = 3939, TotalChunks = 1, TotalBytes = 100, Sha256 = new string('a', 64), EnvelopeJson = "{}" };
+        var envelopeHash = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(offer.EnvelopeJson)));
+        var signed = $"linchuan-handoff-v1\n{offer.Id}\n{offer.GroupId}\n{offer.Generation}\n{offer.TargetDeviceId}\n{offer.TotalChunks}\n{offer.TotalBytes}\n{offer.Sha256}\n{envelopeHash}";
+        offer.Signature = Convert.ToBase64String(keyPair.SignData(Encoding.UTF8.GetBytes(signed), HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1)); HostHandoff.VerifyOffer(offer, group);
+        offer.EnvelopeJson = "{\"tampered\":true}"; rejected = false; try { HostHandoff.VerifyOffer(offer, group); } catch (InvalidDataException) { rejected = true; } Assert(rejected, "密文头篡改拒绝");
+        var key = RandomNumberGenerator.GetBytes(32); var prefix = RandomNumberGenerator.GetBytes(8); var plain = Encoding.UTF8.GetBytes("完整移交 synthetic credential");
+        try
+        {
+            var cipher = HostHandoff.Encrypt(plain, key, prefix, offer, 0); Assert(HostHandoff.Decrypt(cipher, key, prefix, offer, 0).SequenceEqual(plain), "AES-GCM移交解密");
+            rejected = false; try { HostHandoff.Decrypt(cipher, key, prefix, offer, 1); } catch (CryptographicException) { rejected = true; } Assert(rejected, "密文块次序绑定");
+            offer.TargetDeviceId = "wrong-target"; rejected = false; try { HostHandoff.Decrypt(cipher, key, prefix, offer, 0); } catch (CryptographicException) { rejected = true; } Assert(rejected, "密文绑定目标身份");
+            cipher[16] ^= 1; rejected = false; try { HostHandoff.Decrypt(cipher, key, prefix, offer, 0); } catch (CryptographicException) { rejected = true; } Assert(rejected, "密文篡改拒绝");
+        }
+        finally { CryptographicOperations.ZeroMemory(key); CryptographicOperations.ZeroMemory(plain); }
+    }
+
+    private static void HostTransferRestartRecovery(string root)
+    {
+        var path = Path.Combine(root, "receiver", "handoff-receive-key.dpapi"); byte[] publicKey; byte[] wrapped;
+        var secret = RandomNumberGenerator.GetBytes(32);
+        try
+        {
+            using (var first = HostHandoff.LoadReceiveKey(path)) { publicKey = first.ExportSubjectPublicKeyInfo(); wrapped = first.Encrypt(secret, RSAEncryptionPadding.OaepSHA256); Assert(!File.ReadAllBytes(path).AsSpan().SequenceEqual(first.ExportPkcs8PrivateKey()), "接收私钥由DPAPI保护"); }
+            using (var restarted = HostHandoff.LoadReceiveKey(path)) { Assert(publicKey.SequenceEqual(restarted.ExportSubjectPublicKeyInfo()), "重启保持移交接收公钥"); Assert(restarted.Decrypt(wrapped, RSAEncryptionPadding.OaepSHA256).SequenceEqual(secret), "重启仍能解开已密封移交"); }
+            File.WriteAllBytes(path, [1, 2, 3]); var rejected = false; try { using var invalid = HostHandoff.LoadReceiveKey(path); } catch (CryptographicException) { rejected = true; } Assert(rejected, "损坏接收密钥不能静默替换");
+            var offer = new HandoffOffer { GroupId = Guid.NewGuid().ToString(), Generation = 2, Id = Guid.NewGuid().ToString("N") };
+            var pending = new HandoffPending { Offer = offer, DataDir = Path.Combine(root, "groups", offer.GroupId + "-2") };
+            var stage = pending.DataDir + ".staging-" + offer.Id; Directory.CreateDirectory(stage); File.WriteAllText(Path.Combine(stage, "linchuan.sqlite"), "verified fixture");
+            HostHandoff.RestoreImportDirectory(root, pending); Assert(!Directory.Exists(stage) && File.ReadAllText(Path.Combine(pending.DataDir, "linchuan.sqlite")) == "verified fixture", "已校验导入在目录切换前崩溃可恢复");
+            HostHandoff.RestoreImportDirectory(root, pending); Assert(Directory.Exists(pending.DataDir), "导入恢复幂等");
+            Directory.CreateDirectory(stage); File.WriteAllText(Path.Combine(stage, "bundle.zip"), "unused stage"); HostHandoff.RestoreImportDirectory(root, pending); Assert(!Directory.Exists(stage), "恢复清理同事务残留stage");
+            pending.DataDir = root; rejected = false; try { HostHandoff.RestoreImportDirectory(root, pending); } catch (InvalidDataException) { rejected = true; } Assert(rejected, "恢复拒绝越界数据目录");
+        }
+        finally { CryptographicOperations.ZeroMemory(secret); }
+    }
     private static async Task NativeRequestIdentityAsync()
     {
         var allocation = new TcpListener(IPAddress.Loopback, 0); allocation.Start(); var port = ((IPEndPoint)allocation.LocalEndpoint).Port; allocation.Stop();
@@ -188,7 +237,7 @@ internal static class Program
             var directory = Path.Combine(root, "reuse-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(directory);
             if (configured is not null) await File.WriteAllTextAsync(Path.Combine(directory, "cloudflare.json"), JsonSerializer.Serialize(new { publicUrl = configured }));
             using var listener = new TcpListener(System.Net.IPAddress.Loopback, 0); listener.Start(); var port = ((System.Net.IPEndPoint)listener.LocalEndpoint).Port;
-            var reply = Task.Run(async () => { using var connection = await listener.AcceptTcpClientAsync(); await using var stream = connection.GetStream(); _ = await stream.ReadAsync(new byte[1024]); var body = JsonSerializer.SerializeToUtf8Bytes(new { serverName = "邻传", desktopApi = 2, publicUrl = advertised }); await stream.WriteAsync(Encoding.ASCII.GetBytes($"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n")); await stream.WriteAsync(body); });
+            var reply = Task.Run(async () => { using var connection = await listener.AcceptTcpClientAsync(); await using var stream = connection.GetStream(); _ = await stream.ReadAsync(new byte[1024]); var body = JsonSerializer.SerializeToUtf8Bytes(new { serverName = "邻传", desktopApi = 3, publicUrl = advertised }); await stream.WriteAsync(Encoding.ASCII.GetBytes($"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n")); await stream.WriteAsync(body); });
             try
             {
                 await using var host = new BackendHost(); var rejected = false;

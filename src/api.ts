@@ -1,5 +1,6 @@
 import { translate as t, translateError } from './i18n';
 import type { DeviceType, Session } from './types';
+import { networkFetch } from './network';
 
 export const TOKEN_KEY = 'linchuan.token';
 export const PROFILE_KEY = 'linchuan.profile';
@@ -21,7 +22,7 @@ export async function api<T>(
   if (token) headers.set('Authorization', `Bearer ${token}`);
   if (options.body && typeof options.body === 'string')
     headers.set('Content-Type', 'application/json');
-  const response = await fetch(path, {
+  const response = await networkFetch(path, {
     ...options,
     headers,
     credentials: 'same-origin',

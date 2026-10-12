@@ -1,6 +1,12 @@
 import { translate as t, translateError } from './i18n';
 import { api } from './api';
 import type { Message } from './types';
+import {
+  localConnected,
+  networkFetch,
+  networkUrl,
+  selectNetwork,
+} from './network';
 
 export async function uploadFile(
   file: File,
@@ -37,65 +43,94 @@ export async function uploadFile(
       const start = offset;
       const blob = file.slice(start, start + created.chunkBytes);
       try {
-        const result = await new Promise<{ offset: number }>(
-          (resolve, reject) => {
-            const request = new XMLHttpRequest();
-            request.open('PUT', `/api/transfers/${created.id}?offset=${start}`);
-            request.setRequestHeader('Authorization', `Bearer ${token}`);
-            request.setRequestHeader(
-              'Content-Type',
-              'application/octet-stream',
-            );
-            request.timeout = 180000;
-            const abort = () => request.abort();
-            signal.addEventListener('abort', abort, { once: true });
-            const finish = () => signal.removeEventListener('abort', abort);
-            request.upload.onprogress = (event) =>
+        const result = localConnected()
+          ? await (async () => {
+              const response = await networkFetch(
+                `/api/transfers/${created.id}?offset=${start}`,
+                {
+                  method: 'PUT',
+                  headers: {
+                    Authorization: `Bearer ${token}`,
+                    'Content-Type': 'application/octet-stream',
+                  },
+                  body: blob,
+                  signal,
+                },
+              );
+              const data = await response.json();
+              if (!response.ok)
+                throw Object.assign(
+                  new Error(translateError(data.error, response.status)),
+                  { status: response.status },
+                );
               progress(
                 Math.min(
                   99,
-                  Math.round(((start + event.loaded) / file.size) * 100),
+                  Math.round(((start + blob.size) / file.size) * 100),
                 ),
               );
-            request.onload = () => {
-              finish();
-              try {
-                const data = JSON.parse(request.responseText);
-                if (request.status >= 200 && request.status < 300)
-                  resolve(data);
-                else
-                  reject(
-                    Object.assign(
-                      new Error(translateError(data.error, request.status)),
-                      {
-                        status: request.status,
-                      },
-                    ),
-                  );
-              } catch (cause) {
-                reject(cause);
+              return data as { offset: number };
+            })()
+          : await new Promise<{ offset: number }>((resolve, reject) => {
+              const request = new XMLHttpRequest();
+              request.open(
+                'PUT',
+                networkUrl(`/api/transfers/${created.id}?offset=${start}`),
+              );
+              request.setRequestHeader('Authorization', `Bearer ${token}`);
+              request.setRequestHeader(
+                'Content-Type',
+                'application/octet-stream',
+              );
+              request.timeout = 180000;
+              const abort = () => request.abort();
+              signal.addEventListener('abort', abort, { once: true });
+              const finish = () => signal.removeEventListener('abort', abort);
+              request.upload.onprogress = (event) =>
+                progress(
+                  Math.min(
+                    99,
+                    Math.round(((start + event.loaded) / file.size) * 100),
+                  ),
+                );
+              request.onload = () => {
+                finish();
+                try {
+                  const data = JSON.parse(request.responseText);
+                  if (request.status >= 200 && request.status < 300)
+                    resolve(data);
+                  else
+                    reject(
+                      Object.assign(
+                        new Error(translateError(data.error, request.status)),
+                        {
+                          status: request.status,
+                        },
+                      ),
+                    );
+                } catch (cause) {
+                  reject(cause);
+                }
+              };
+              request.onerror = () => {
+                finish();
+                reject(new Error(t('网络中断，分块未上传完成。')));
+              };
+              request.ontimeout = () => {
+                finish();
+                reject(new Error(t('上传超时，请检查网络。')));
+              };
+              request.onabort = () => {
+                finish();
+                reject(new DOMException(t('已取消上传'), 'AbortError'));
+              };
+              if (signal.aborted) {
+                finish();
+                reject(new DOMException(t('已取消上传'), 'AbortError'));
+                return;
               }
-            };
-            request.onerror = () => {
-              finish();
-              reject(new Error(t('网络中断，分块未上传完成。')));
-            };
-            request.ontimeout = () => {
-              finish();
-              reject(new Error(t('上传超时，请检查网络。')));
-            };
-            request.onabort = () => {
-              finish();
-              reject(new DOMException(t('已取消上传'), 'AbortError'));
-            };
-            if (signal.aborted) {
-              finish();
-              reject(new DOMException(t('已取消上传'), 'AbortError'));
-              return;
-            }
-            request.send(blob);
-          },
-        );
+              request.send(blob);
+            });
         if (
           !Number.isSafeInteger(result.offset) ||
           result.offset <= start ||
@@ -113,6 +148,7 @@ export async function uploadFile(
           )
         )
           throw cause;
+        await selectNetwork();
         const state = await api<{ offset: number }>(
           `/api/transfers/${created.id}`,
           { signal },
