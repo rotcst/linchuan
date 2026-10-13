@@ -2,6 +2,10 @@
 
 A maintainer can generate a recipient-bound offline package to restore lost public configuration on the current host; this is not a general recovery entry bundled with the EXE. It verifies the local group, owner, generation and port using a read-only database, then protects credentials with that Windows user's DPAPI. Chats and files remain unchanged. Packages expire within 24 hours; run `恢复公网.cmd` locally on the target, then quit from the tray and restart. Maintainers create ciphertext through the [recovery CLI](scripts/public-recovery-cli.ts) using private standard input, then use the [directory builder](scripts/build-public-recovery.ts) to generate a launcher with fixed integrity hashes. Do not publish credential packages to GitHub.
 
+### Windows attachment drafts (1.2.2)
+
+Copy files on the desktop or in File Explorer, then press Ctrl+V in the chat input to stage them. Repeated pastes can collect multiple files alongside text. Press Enter or click **Send** to submit the draft; Shift+Enter inserts a new line. Pasted screenshots, selected files and dropped files are also staged and can be removed before sending. Ordinary text paste keeps its existing behavior. This change applies to the native Windows client.
+
 ### Public entry preservation after transfer (1.2.1)
 
 The public origin is persisted with the group snapshot. A complete transfer validates the origin and protected credential, then checks the destination group and generation before activation. Both PCs retain the public entry after transfer and the new host retains it after restart. Upgrade both Windows PCs. Preserve original data after a failed transfer and resume or retry the complete transfer; manually joining another service is not a completed migration. Upgrading cannot create Cloudflare credentials for an independent new group.

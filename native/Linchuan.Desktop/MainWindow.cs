@@ -4,6 +4,7 @@ using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Runtime.InteropServices;
 using Linchuan.Desktop.Core;
 using Microsoft.Win32;
 
@@ -21,6 +22,8 @@ public sealed class MainWindow : AppWindow
     private readonly Dictionary<string, ChatMessage> _known = [];
     private readonly ObservableCollection<MessageView> _messages = [];
     private readonly Dictionary<string, int> _unread = [];
+    private readonly List<string> _pendingFiles = [];
+    private readonly HashSet<string> _temporaryAttachments = new(StringComparer.OrdinalIgnoreCase);
     private readonly TaskCompletionSource _loaded = new();
     private ListBox _list = new();
     private StackPanel _devices = new();
@@ -28,6 +31,7 @@ public sealed class MainWindow : AppWindow
     private TextBlock _status = new(), _hostStatus = new(), _error = new(), _title = new(), _subtitle = new(), _code = new(), _transfer = new();
     private Button _older = new();
     private Button _cancel = new(), _entryMenu = new();
+    private WrapPanel _attachments = new();
     private TextBox _address = new();
     private Image _qr = new();
     private CancellationTokenSource? _transferCancellation;
@@ -37,6 +41,7 @@ public sealed class MainWindow : AppWindow
     private string? _beforeId;
     private long? _before;
     private bool _exit, _busy, _loading;
+    private bool _sendingComposer;
     private int _generation;
     private readonly UpdateChecker _updates;
     private readonly BackendHost _backend;
@@ -56,8 +61,8 @@ public sealed class MainWindow : AppWindow
         Loaded += (_, _) => _loaded.TrySetResult();
         Closing += (_, e) => { if (!_exit && _options.VerifyOutput is null) { e.Cancel = true; Hide(); } };
         AllowDrop = true;
-        PreviewDragOver += (_, e) => { e.Effects = e.Data.GetDataPresent(DataFormats.FileDrop) ? DragDropEffects.Copy : DragDropEffects.None; e.Handled = true; };
-        Drop += async (_, e) => { if (e.Data.GetData(DataFormats.FileDrop) is string[] paths) await RunAsync(() => UploadFilesAsync(paths)); e.Handled = true; };
+        PreviewDragOver += (_, e) => { e.Effects = ClipboardFileDrop.TryGetPaths(e.Data) is not null ? DragDropEffects.Copy : DragDropEffects.None; e.Handled = true; };
+        Drop += (_, e) => { var paths = ClipboardFileDrop.TryGetPaths(e.Data); if (paths is not null) _ = RunAsync(() => { StageFiles(paths); return Task.CompletedTask; }); e.Handled = true; };
         Build(); ReadyTask = InitializeAsync();
     }
     public LanClient? Client { get; private set; }
@@ -76,6 +81,7 @@ public sealed class MainWindow : AppWindow
     private CopyFeedback? _copyFeedback;
     private void Build()
     {
+        var draft = _composer.Text;
         _copyFeedback?.Dispose(); _copyFeedback = new CopyFeedback(value => ClipboardWriter(value));
         Title = L.T("邻传") + " · " + L.T("设备互传");
         var root = new Grid(); root.SetResourceReference(Panel.BackgroundProperty, "Page");
@@ -107,19 +113,20 @@ public sealed class MainWindow : AppWindow
         _list.SetResourceReference(Control.BackgroundProperty, "Surface"); ScrollViewer.SetHorizontalScrollBarVisibility(_list, ScrollBarVisibility.Disabled); ScrollViewer.SetCanContentScroll(_list, true); VirtualizingPanel.SetIsVirtualizing(_list, true); VirtualizingPanel.SetVirtualizationMode(_list, VirtualizationMode.Recycling);
         var itemStyle = new Style(typeof(ListBoxItem)); itemStyle.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(0))); itemStyle.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(0))); itemStyle.Setters.Add(new Setter(Control.HorizontalContentAlignmentProperty, HorizontalAlignment.Stretch)); itemStyle.Setters.Add(new Setter(Control.FocusVisualStyleProperty, null)); itemStyle.Setters.Add(new Setter(Control.TemplateProperty, new ControlTemplate(typeof(ListBoxItem)) { VisualTree = new FrameworkElementFactory(typeof(ContentPresenter)) })); _list.ItemContainerStyle = itemStyle;
         var factory = new FrameworkElementFactory(typeof(MessageCard)); factory.SetBinding(MessageCard.ModelProperty, new System.Windows.Data.Binding()); _list.ItemTemplate = new DataTemplate { VisualTree = factory }; Grid.SetRow(_list, 2); chat.Children.Add(_list);
-        var composer = new Grid { Margin = new Thickness(12) }; composer.RowDefinitions.Add(new RowDefinition()); composer.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); composer.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); composer.ColumnDefinitions.Add(new ColumnDefinition()); composer.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        var composer = new Grid { Margin = new Thickness(12) }; composer.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); composer.RowDefinitions.Add(new RowDefinition()); composer.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); composer.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); composer.ColumnDefinitions.Add(new ColumnDefinition()); composer.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         var attach = Ui.Button("", () => ChooseFiles(false), "ChooseFiles"); attach.Content = Ui.Icon("attach"); attach.ToolTip = L.T("选择文件"); var photo = Ui.Button("", () => ChooseFiles(true), "ChooseMedia"); photo.Content = Ui.Icon("image"); photo.ToolTip = L.T("选择照片或视频"); foreach (var button in new[] { attach, photo }) { button.Width = button.Height = 32; button.Padding = new Thickness(4); button.BorderThickness = new Thickness(0); button.SetResourceReference(Control.BackgroundProperty, "Surface"); }
-        composer.Children.Add(Ui.Row(attach, photo));
+        var attachRow = Ui.Row(attach, photo); Grid.SetRow(attachRow, 1); composer.Children.Add(attachRow);
         _composer = Ui.Input("", "Composer", true); _composer.MinHeight = 48; _composer.MaxHeight = 144; _composer.BorderThickness = new Thickness(0); _composer.SetResourceReference(Control.BackgroundProperty, "Surface"); _composer.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
-        _composer.PreviewKeyDown += async (_, e) => { if (e.Key == Key.Enter && (Keyboard.Modifiers & ModifierKeys.Shift) == 0) { e.Handled = true; await RunAsync(() => SendTextAsync(_composer.Text)); } };
-        DataObject.AddPastingHandler(_composer, async (_, e) => { if (e.DataObject.GetDataPresent(DataFormats.FileDrop)) { e.CancelCommand(); await RunAsync(() => UploadFilesAsync((string[])e.DataObject.GetData(DataFormats.FileDrop)!)); } else if (e.DataObject.GetDataPresent(DataFormats.Bitmap)) { e.CancelCommand(); await RunAsync(PasteImageAsync); } });
+        _composer.PreviewKeyDown += async (_, e) => { if (e.Key == Key.Enter && (Keyboard.Modifiers & ModifierKeys.Shift) == 0) { e.Handled = true; await RunAsync(SendComposerAsync); } };
+        _composer.CommandBindings.Add(new CommandBinding(ApplicationCommands.Paste, (_, e) => { var data = TryGetClipboardData(); if (data is not null && HandleSpecialPaste(data)) e.Handled = true; }, (_, e) => { var data = TryGetClipboardData(); var special = data is not null && (ClipboardFileDrop.TryGetPaths(data) is not null || data.GetDataPresent(DataFormats.Bitmap, true)); e.CanExecute = special; e.Handled = special; }));
         var input = new Grid(); input.Children.Add(_composer); var placeholder = Ui.Text("输入消息，或把文件拖到这里", 14, "Muted"); placeholder.IsHitTestVisible = false; placeholder.Margin = new Thickness(10, 0, 10, 0); input.Children.Add(placeholder); _composer.TextChanged += (_, _) => placeholder.Visibility = _composer.Text.Length == 0 ? Visibility.Visible : Visibility.Collapsed; Grid.SetColumn(input, 1); composer.Children.Add(input);
-        var send = Ui.AsyncButton("发送", () => RunAsync(() => SendTextAsync(_composer.Text)), "Send", true); send.Margin = new Thickness(8, 4, 0, 4); Grid.SetColumn(send, 2); composer.Children.Add(send);
-        var hint = Ui.Text("Enter 发送 · Shift + Enter 换行", 11, "Muted"); hint.HorizontalAlignment = HorizontalAlignment.Right; Grid.SetRow(hint, 1); Grid.SetColumnSpan(hint, 3); composer.Children.Add(hint); var composerFrame = Ui.Border(composer, "Surface", 0); composerFrame.Margin = new Thickness(16, 10, 16, 16); Grid.SetRow(composerFrame, 3); chat.Children.Add(composerFrame); Grid.SetColumn(chat, 1); Grid.SetRow(chat, 1); root.Children.Add(chat);
+        var attachments = new WrapPanel(); var attachmentScroll = new ScrollViewer { Content = attachments, MaxHeight = 112, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled, VerticalScrollBarVisibility = ScrollBarVisibility.Auto }; Grid.SetRow(attachmentScroll, 0); Grid.SetColumnSpan(attachmentScroll, 3); composer.Children.Add(attachmentScroll); _attachments = attachments; RenderPendingAttachments();
+        var send = Ui.AsyncButton("发送", () => RunAsync(SendComposerAsync), "Send", true); send.Margin = new Thickness(8, 4, 0, 4); Grid.SetColumn(send, 2); Grid.SetRow(send, 1); composer.Children.Add(send);
+        Grid.SetRow(input, 1); var hint = Ui.Text("Enter 发送 · Shift + Enter 换行", 11, "Muted"); hint.HorizontalAlignment = HorizontalAlignment.Right; Grid.SetRow(hint, 2); Grid.SetColumnSpan(hint, 3); composer.Children.Add(hint); var composerFrame = Ui.Border(composer, "Surface", 0); composerFrame.Margin = new Thickness(16, 10, 16, 16); Grid.SetRow(composerFrame, 3); chat.Children.Add(composerFrame); Grid.SetColumn(chat, 1); Grid.SetRow(chat, 1); root.Children.Add(chat);
         var side = Ui.Border(new ScrollViewer { Content = BuildInspector(), VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled }, "Rail", 18, 0); Grid.SetRow(side, 1); Grid.SetColumn(side, 2); root.Children.Add(side);
         _error = Ui.Text("", 12, "Danger"); _error.Margin = new Thickness(18, 8, 18, 8); _error.Visibility = Visibility.Collapsed; Grid.SetRow(_error, 1); Grid.SetColumn(_error, 1); _error.VerticalAlignment = VerticalAlignment.Top; Panel.SetZIndex(_error, 4); root.Children.Add(_error);
         Grid.SetRow(_copyFeedback.View, 2); Panel.SetZIndex(_copyFeedback.View, 5); chat.Children.Add(_copyFeedback.View);
-        Content = root; RenderDevices(); UpdateHeading();
+        Content = root; _composer.Text = draft; RenderDevices(); UpdateHeading();
     }
     private StackPanel BuildInspector()
     {
@@ -263,6 +270,7 @@ public sealed class MainWindow : AppWindow
     private static string ConnectionLabel(LanClient client) => client.Network is null ? "已连接" : client.ActiveUri.IsLoopback ? "本机连接" : NetworkRoutes.IsPrivateLan(client.ActiveUri.AbsoluteUri) ? "局域网连接" : "互联网连接";
     private void ShowJoin()
     {
+        if (Client?.Session is not null && !CanChangeComposerConnection) { ShowError(new InvalidOperationException(L.T("请先发送或清空当前草稿。"))); return; }
         var dialog = Dialog("连接你的设备"); var panel = new StackPanel { Margin = new Thickness(24) }; panel.Children.Add(Ui.Text("连接你的设备", 22));
         panel.Children.Add(Ui.Text("连接地址", 12, "Muted")); var address = Ui.Input(Target, "JoinAddress"); address.Margin = new Thickness(0, 6, 0, 12); panel.Children.Add(address);
         panel.Children.Add(Ui.Text("设备名称", 12, "Muted")); var name = Ui.Input(Environment.MachineName, "JoinName"); name.MaxLength = 30; name.Margin = new Thickness(0, 6, 0, 12); panel.Children.Add(name);
@@ -275,7 +283,8 @@ public sealed class MainWindow : AppWindow
             try
             {
                 if (!Uri.TryCreate(address.Text.Trim(), UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https") || uri.UserInfo.Length > 0) throw new ArgumentException(L.T("请填写有效的连接地址。"));
-                var target = uri.GetLeftPart(UriPartial.Authority); if (Target != target) { if (Client is not null) await Client.DisposeAsync(); _host = null; _known.Clear(); _messages.Clear(); _entry = ""; SetClient(target); }
+                if (Client?.Session is not null && !CanChangeComposerConnection) throw new InvalidOperationException(L.T("请先发送或清空当前草稿。"));
+                var target = uri.GetLeftPart(UriPartial.Authority); if (Target != target) { if (Client is not null) await Client.DisposeAsync(); _host = null; _known.Clear(); _messages.Clear(); _entry = ""; _conversation = "all"; SetClient(target); }
                 _info = await Client!.InfoAsync(Lifetime); if (selected is not null && _host is not null) await Client.ClaimDesktopAsync(selected, code.Text.Trim(), Lifetime); else await Client.JoinAsync(code.Text.Trim(), name.Text.Trim(), Guid.NewGuid().ToString("N"), Lifetime);
                 await CompleteJoinAsync(); dialog.Close();
             }
@@ -308,7 +317,7 @@ public sealed class MainWindow : AppWindow
         if (Client.Network is not null && _options.VerifyOutput is null) _ = MonitorHandoffAsync();
     }
     private bool Matches(ChatMessage message) => _conversation == "all" ? message.To == "all" : message.To != "all" && (message.From == _conversation || message.To == _conversation);
-    public async Task SelectConversationAsync(string id) { _conversation = id; _unread.Remove(id); UpdateHeading(); RenderDevices(); await LoadHistoryAsync(false); }
+    public async Task SelectConversationAsync(string id) { if (id != _conversation && (_pendingFiles.Count > 0 || _sendingComposer)) { AppDialog.Show(L.T("请先发送或移除待发送附件。"), L.T("待发送附件"), this); return; } _conversation = id; _unread.Remove(id); UpdateHeading(); RenderDevices(); await LoadHistoryAsync(false); }
     public void SelectConversation(string id) => _ = RunAsync(() => SelectConversationAsync(id));
     private void UpdateHeading() { var device = Client?.Devices.FirstOrDefault(item => item.Id == _conversation); _title.Text = _conversation == "all" ? L.T("公共聊天室") : device?.Name ?? L.T("设备私聊"); _subtitle.Text = L.T(_conversation == "all" ? "发给所有在线设备" : device?.Online == true ? "设备私聊 · 在线" : "设备私聊 · 对方离线，可留言"); }
     private void RenderDevices()
@@ -392,19 +401,91 @@ public sealed class MainWindow : AppWindow
     }
     private void AddVisible(ChatMessage message, bool scroll) { if (!Matches(message) || _messages.Any(view => view.Message.Id == message.Id)) return; _messages.Add(new MessageView(message, this)); if (scroll) _list.ScrollIntoView(_messages[^1]); }
     public async Task SendTextAsync(string text) { if (Client?.Session is null || string.IsNullOrWhiteSpace(text)) return; var message = await Client.SendTextAsync(_conversation, text.Trim(), Lifetime); _known[message.Id] = message; AddVisible(message, true); if (_composer.Text == text) _composer.Clear(); }
-    private void ChooseFiles(bool media) { var dialog = new OpenFileDialog { Multiselect = true, Filter = media ? "Media|*.png;*.jpg;*.jpeg;*.gif;*.webp;*.heic;*.mp4;*.mov;*.webm;*.mkv|All files|*.*" : "All files|*.*" }; if (dialog.ShowDialog(this) == true) _ = RunAsync(() => UploadFilesAsync(dialog.FileNames)); }
-    private async Task UploadFilesAsync(string[] paths) { if (paths.Length > 20) throw new InvalidOperationException(L.T("一次最多选择 20 个文件。")); foreach (var path in paths) await UploadFileAsync(path); }
-    public async Task UploadFileAsync(string path)
+    private void ChooseFiles(bool media) { var dialog = new OpenFileDialog { Multiselect = true, Filter = media ? "Media|*.png;*.jpg;*.jpeg;*.gif;*.webp;*.heic;*.mp4;*.mov;*.webm;*.mkv|All files|*.*" : "All files|*.*" }; if (dialog.ShowDialog(this) == true) _ = RunAsync(() => { StageFiles(dialog.FileNames); return Task.CompletedTask; }); }
+    private void StageFiles(IEnumerable<string> paths)
     {
-        if (Client?.Session is null) throw new InvalidOperationException(L.T("请先连接设备。")); await _uploads.WaitAsync(Lifetime); _busy = true; _cancel.Visibility = Visibility.Visible; using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(Lifetime); _transferCancellation = cancellation; var client = Client; var destination = _conversation;
-        try { _transfer.Text = Path.GetFileName(path) + " · " + L.T("等待上传…"); await client.UploadAsync(path, destination, new Progress<UploadProgress>(progress => _transfer.Text = Path.GetFileName(path) + $" · {progress.Percent}%"), cancellation.Token); _transfer.Text = L.T("已发送"); }
-        catch (OperationCanceledException) when (!Lifetime.IsCancellationRequested) { _transfer.Text = L.T("已取消上传"); }
+        var incoming = paths.Where(value => !string.IsNullOrWhiteSpace(value)).Select(value => value.Trim()).Distinct(StringComparer.OrdinalIgnoreCase).Where(value => !_pendingFiles.Contains(value, StringComparer.OrdinalIgnoreCase)).ToArray();
+        if (_pendingFiles.Count + incoming.Length > 20) throw new InvalidOperationException(L.T("一次最多选择 20 个文件。"));
+        foreach (var path in incoming)
+        {
+            _pendingFiles.Add(path);
+        }
+        RenderPendingAttachments();
+    }
+    private bool HandleSpecialPaste(IDataObject data)
+    {
+        var paths = ClipboardFileDrop.TryGetPaths(data);
+        if (paths is not null) { _ = RunAsync(() => { StageFiles(paths); return Task.CompletedTask; }); return true; }
+        if (data.GetDataPresent(DataFormats.Bitmap, true)) { _ = RunAsync(() => PasteImageAsync(data)); return true; }
+        return false;
+    }
+    private static IDataObject? TryGetClipboardData()
+    {
+        try { return Clipboard.GetDataObject(); }
+        catch (ExternalException) { return null; }
+    }
+    private void RenderPendingAttachments()
+    {
+        if (_attachments is null) return;
+        _attachments.Children.Clear();
+        foreach (var path in _pendingFiles.ToArray())
+        {
+            var remove = Ui.Button("×", () => RemovePendingFile(path), "RemoveAttachment-" + _pendingFiles.IndexOf(path)); remove.Width = 24; remove.Height = 24; remove.Padding = new Thickness(0); remove.ToolTip = L.T("移除附件"); remove.IsEnabled = !_sendingComposer;
+            var name = Path.GetFileName(path); var label = Ui.Text(name, 12); label.TextTrimming = TextTrimming.CharacterEllipsis; label.TextWrapping = TextWrapping.NoWrap; label.Width = 150; label.ToolTip = name; AutomationProperties.SetName(remove, L.T("移除附件") + " " + name);
+            var chip = Ui.Border(Ui.Row(label, remove), "Field", 6); chip.Margin = new Thickness(0, 0, 6, 4); _attachments.Children.Add(chip);
+        }
+    }
+    private void RemovePendingFile(string path)
+    {
+        if (_sendingComposer) return;
+        _pendingFiles.Remove(path);
+        DeleteTemporaryAttachment(path);
+        RenderPendingAttachments();
+    }
+    private void DeleteTemporaryAttachment(string path)
+    {
+        if (!_temporaryAttachments.Contains(path)) return;
+        try { File.Delete(path); _temporaryAttachments.Remove(path); }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+    private async Task SendComposerAsync()
+    {
+        if (_sendingComposer || (string.IsNullOrWhiteSpace(_composer.Text) && _pendingFiles.Count == 0)) return;
+        _sendingComposer = true;
+        RenderPendingAttachments();
+        try
+        {
+            var text = _composer.Text;
+            var batchClient = Client;
+            var destination = _conversation;
+            var files = _pendingFiles.ToArray();
+            if (!string.IsNullOrWhiteSpace(text)) await SendTextAsync(text);
+            foreach (var path in files)
+            {
+                if (Client != batchClient) throw new InvalidOperationException(L.T("连接已变更，请重新发送剩余附件。"));
+                if (!await UploadFileAsync(path, destination, batchClient)) break;
+                _pendingFiles.Remove(path);
+                DeleteTemporaryAttachment(path);
+                RenderPendingAttachments();
+            }
+        }
+        finally { _sendingComposer = false; RenderPendingAttachments(); }
+    }
+    public async Task<bool> UploadFileAsync(string path, string? destinationOverride = null, LanClient? expectedClient = null)
+    {
+        if (Client?.Session is null) throw new InvalidOperationException(L.T("请先连接设备。")); await _uploads.WaitAsync(Lifetime); _busy = true; _cancel.Visibility = Visibility.Visible; using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(Lifetime); _transferCancellation = cancellation; var client = expectedClient ?? Client; var destination = destinationOverride ?? _conversation;
+        try { if (Client != client) throw new InvalidOperationException(L.T("连接已变更，请重新发送剩余附件。")); _transfer.Text = Path.GetFileName(path) + " · " + L.T("等待上传…"); await client.UploadAsync(path, destination, new Progress<UploadProgress>(progress => _transfer.Text = Path.GetFileName(path) + $" · {progress.Percent}%"), cancellation.Token); _transfer.Text = L.T("已发送"); return true; }
+        catch (OperationCanceledException) when (!Lifetime.IsCancellationRequested) { _transfer.Text = L.T("已取消上传"); return false; }
         finally { _busy = false; _cancel.Visibility = Visibility.Collapsed; _transferCancellation = null; _uploads.Release(); }
     }
-    private async Task PasteImageAsync()
+    private async Task PasteImageAsync(IDataObject? source = null)
     {
-        var bitmap = Clipboard.GetImage(); if (bitmap is null) return; var directory = Path.Combine(_options.ClientDir, "cache"); ManagedPaths.Create(directory); var file = Path.Combine(directory, "clipboard-" + Guid.NewGuid().ToString("N") + ".png");
-        try { var encoder = new System.Windows.Media.Imaging.PngBitmapEncoder(); encoder.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(bitmap)); using (var output = File.Create(file)) encoder.Save(output); await UploadFileAsync(file); } finally { if (File.Exists(file)) File.Delete(file); }
+        var bitmap = (source?.GetData(DataFormats.Bitmap, true) as System.Windows.Media.Imaging.BitmapSource) ?? Clipboard.GetImage(); if (bitmap is null) return; var directory = Path.Combine(_options.ClientDir, "cache"); ManagedPaths.Create(directory); var file = Path.Combine(directory, "clipboard-" + Guid.NewGuid().ToString("N") + ".png");
+        _temporaryAttachments.Add(file);
+        try { var encoder = new System.Windows.Media.Imaging.PngBitmapEncoder(); encoder.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(bitmap)); using (var output = File.Create(file)) encoder.Save(output); StageFiles([file]); }
+        catch { DeleteTemporaryAttachment(file); throw; }
+        await Task.CompletedTask;
     }
     public async Task HideMessageAsync(ChatMessage message, bool prompt = true)
     {
@@ -428,8 +509,13 @@ public sealed class MainWindow : AppWindow
     {
         if (Client?.Session is null) { ShowJoin(); return; }
         var dialog = Dialog("设备设置"); var panel = new StackPanel { Margin = new Thickness(24) }; panel.Children.Add(Ui.Text("设备设置", 22)); panel.Children.Add(Ui.Text("设备名称", 12, "Muted")); var name = Ui.Input(Client.Session.Device.Name, "DeviceName"); name.MaxLength = 30; name.Margin = new Thickness(0, 8, 0, 12); panel.Children.Add(name);
-        var save = Ui.AsyncButton("保存修改", () => RunAsync(async () => { await Client.UpdateDeviceAsync(name.Text.Trim(), DeviceType.Computer, Lifetime); await CompleteJoinAsync(); dialog.Close(); }), "SaveSettings", true); save.Margin = new Thickness(0, 0, 0, 10); panel.Children.Add(save); var switchHost = Ui.Button("切换服务电脑", () => { dialog.Close(); ShowJoin(); }, "SwitchHost"); switchHost.Margin = new Thickness(0, 0, 0, 10); panel.Children.Add(switchHost); panel.Children.Add(Ui.AsyncButton("退出当前设备", () => RunAsync(async () => { await Client.LogoutAsync(Lifetime); _preferences.DeviceId = ""; _preferences.Save(_options.ClientDir); _known.Clear(); _messages.Clear(); Build(); dialog.Close(); ShowJoin(); }), "Logout")); dialog.Content = panel; dialog.ShowDialog();
+        var save = Ui.AsyncButton("保存修改", () => RunAsync(async () => { await Client.UpdateDeviceAsync(name.Text.Trim(), DeviceType.Computer, Lifetime); await CompleteJoinAsync(); dialog.Close(); }), "SaveSettings", true); save.Margin = new Thickness(0, 0, 0, 10); panel.Children.Add(save);
+        var switchHost = Ui.Button("切换服务电脑", () => { dialog.Close(); ShowJoin(); }, "SwitchHost"); switchHost.Margin = new Thickness(0, 0, 0, 10); panel.Children.Add(switchHost);
+        var logout = Ui.AsyncButton("退出当前设备", () => RunAsync(async () => { if (!CanChangeComposerConnection) throw new InvalidOperationException(L.T("请先发送或清空当前草稿。")); await Client.LogoutAsync(Lifetime); _preferences.DeviceId = ""; _preferences.Save(_options.ClientDir); _known.Clear(); _messages.Clear(); _composer.Clear(); _conversation = "all"; foreach (var path in _temporaryAttachments.ToArray()) DeleteTemporaryAttachment(path); Build(); dialog.Close(); ShowJoin(); }), "Logout"); panel.Children.Add(logout);
+        foreach (var control in new[] { switchHost, logout }) { control.IsEnabled = CanChangeComposerConnection; if (!control.IsEnabled) control.ToolTip = L.T("请先发送或清空当前草稿。"); }
+        dialog.Content = panel; dialog.ShowDialog();
     }
+    private bool CanChangeComposerConnection => !_sendingComposer && _pendingFiles.Count == 0 && string.IsNullOrWhiteSpace(_composer.Text);
     private AppWindow Dialog(string title) => AppDialog.Create(title, this);
     public void ChangeAppearance(string? language, string? theme) { if (language is not null) _preferences.Language = language; if (theme is not null) _preferences.Theme = theme; L.Set(_preferences.Language); Theme.Apply(_preferences.Theme); _preferences.Save(_options.ClientDir); Build(); _ = RefreshQrAsync(); }
     internal Button CreateCopyButton(string label, Func<string> value, string id, string successKey)
@@ -444,7 +530,7 @@ public sealed class MainWindow : AppWindow
     public async Task RunAsync(Func<Task> action) { try { await action(); _error.Visibility = Visibility.Collapsed; } catch (OperationCanceledException) when (Lifetime.IsCancellationRequested) { } catch (Exception ex) { ShowError(ex); } }
     private void ShowError(Exception ex) { _error.Text = L.T(ex.Message); _error.Visibility = Visibility.Visible; }
     public void RequestExit() { _exit = true; ExitRequested?.Invoke(); }
-    public async Task ShutdownAsync() { _exit = true; _lifetime.Cancel(); _copyFeedback?.Dispose(); if (Client is not null) await Client.DisposeAsync(); if (_previousHandoffClient is not null) await _previousHandoffClient.DisposeAsync(); await _handoff.DisposeAsync(); Close(); }
+    public async Task ShutdownAsync() { _exit = true; _lifetime.Cancel(); _copyFeedback?.Dispose(); if (Client is not null) await Client.DisposeAsync(); if (_previousHandoffClient is not null) await _previousHandoffClient.DisposeAsync(); await _uploads.WaitAsync(); try { foreach (var path in _temporaryAttachments.ToArray()) DeleteTemporaryAttachment(path); } finally { _uploads.Release(); } await _handoff.DisposeAsync(); Close(); }
 }
 
 public sealed class MessageCard : Border

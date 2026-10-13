@@ -10,5 +10,6 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="..\Linchuan.Desktop\Core\*.cs" LinkBase="Core" />
+    <Compile Include="..\Linchuan.Desktop\ClipboardFileDrop.cs" Link="ClipboardFileDrop.cs" />
   </ItemGroup>
 </Project>

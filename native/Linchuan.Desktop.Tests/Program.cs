@@ -40,11 +40,22 @@ internal static class Program
             Assert(new UploadProgress { UploadedBytes = 20, TotalBytes = 10 }.Percent == 100, "上传进度上限");
             Assert(new UploadProgress { UploadedBytes = -1, TotalBytes = 10 }.Percent == 0, "上传进度下限");
             Assert(new UploadProgress { UploadedBytes = long.MaxValue, TotalBytes = long.MaxValue }.Percent == 100, "大整数进度");
+            ClipboardFileDropTests();
             await RealServiceReconnectAsync(root);
             Console.WriteLine("native core security tests passed");
             return 0;
         }
         finally { try { Directory.Delete(root, recursive: true); } catch { } }
+    }
+
+    private static void ClipboardFileDropTests()
+    {
+        var data = new System.Windows.DataObject();
+        data.SetData(System.Windows.DataFormats.FileDrop, new[] { "C:\\QA\\archive.zip", "C:\\QA\\archive.zip", "C:\\QA\\photo.png" });
+        var paths = Linchuan.Desktop.ClipboardFileDrop.TryGetPaths(data);
+        Assert(paths is not null && paths.SequenceEqual(new[] { "C:\\QA\\archive.zip", "C:\\QA\\photo.png" }, StringComparer.OrdinalIgnoreCase), "clipboard FileDrop supports multiple distinct files");
+        var text = new System.Windows.DataObject(System.Windows.DataFormats.UnicodeText, "not a file");
+        Assert(Linchuan.Desktop.ClipboardFileDrop.TryGetPaths(text) is null, "clipboard text does not become upload");
     }
 
     private static async Task UpdateCheckerValidationAsync()

@@ -8,6 +8,7 @@ using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Input;
 using Linchuan.Desktop.Core;
 
 namespace Linchuan.Desktop;
@@ -50,6 +51,8 @@ internal static class NativeVerification
         }
         finally { foreach (var file in new[] { binary, downloaded, image1, image2 }) if (File.Exists(file)) File.Delete(file); }
         await window.SelectConversationAsync("all");
+        await VerifyComposerAttachmentsAsync(window, phone, options, directory);
+        checks.Add("Real Ctrl+V FileDrop staging / text fallback / multi-file Enter send / retry and removal behavior");
         await VerifyConnectionEntriesAsync(window, native); checks.Add("Actual backend configured public URL + local/LAN entries / selection updates address without selecting loopback by default");
         foreach (var language in new[] { "zh", "en", "ko", "ja" }) foreach (var theme in new[] { "light", "dark" }) { window.ChangeAppearance(language, theme); window.UpdateLayout(); await Task.Delay(120); Screenshot(window, Path.Combine(directory, $"native-{language}-{theme}.png")); Assert(Find<TextBox>(window, "Composer")!.FocusVisualStyle is null, "no outer focus halo"); }
         checks.Add("Four languages × two themes / actual WPF screenshots");
@@ -82,7 +85,7 @@ internal static class NativeVerification
             var confirmation = Application.Current.Windows.OfType<AppWindow>().Single(dialog => dialog != window && dialog.Title == L.T("仅从本设备删除")); await WaitForCornersAsync(confirmation); Assert(NativeWindowCapture.HasExpectedCorners(confirmation), "confirmation rounded frame"); Screenshot(confirmation, Path.Combine(directory, "native-confirm-" + theme + ".png")); Find<Button>(confirmation, "ConfirmCancel")!.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); Assert((await native.HistoryAsync()).Messages.Any(message => message.Id == sent.Id), "cancel deletion retains message");
         }
         Assert(Find<Button>(window, "AddDevice") is null && Find<Button>(window, "ConnectOther") is null, "duplicate connection entry points removed"); checks.Add("Actual native captions and dialogs match theme / four uncropped round flags / single connection panel");
-        Assert(NativeWindowCapture.HasExpectedCorners(window), "main window rounded frame"); Assert(NativeWindowCapture.HitTest(window, new Point(window.ActualWidth / 2, 16)) == 2, "native draggable caption hit test"); Assert(NativeWindowCapture.HitTest(window, new Point(2, window.ActualHeight / 2)) == 10, "native left resize edge hit test"); Find<Button>(window, "WindowMaximize")!.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); await Task.Delay(160); Assert(window.WindowState == WindowState.Maximized && NativeWindowCapture.HasExpectedCorners(window), "caption maximize with full rectangular work area"); Screenshot(window, Path.Combine(directory, "native-maximized.png")); Assert(NativeWindowCapture.FitsWorkArea(window, Find<Button>(window, "Send")!), "maximized composer remains within monitor work area"); Find<Button>(window, "WindowMaximize")!.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); await Task.Delay(120); Assert(window.WindowState == WindowState.Normal && NativeWindowCapture.HasExpectedCorners(window), "caption restore reinstates rounded corners"); Find<Button>(window, "WindowMinimize")!.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); await Task.Delay(120); Assert(window.WindowState == WindowState.Minimized, "caption minimize"); System.Windows.SystemCommands.RestoreWindow(window); await Task.Delay(120); checks.Add("Rounded main/media/dialog windows / maximize resets corners / restore reinstates rounding / native drag and resize hit tests");
+        Assert(NativeWindowCapture.HasExpectedCorners(window), "main window rounded frame"); Assert(NativeWindowCapture.HitTest(window, new Point(window.ActualWidth / 2, 16)) == 2, "native draggable caption hit test"); Assert(NativeWindowCapture.HitTest(window, new Point(2, window.ActualHeight / 2)) == 10, "native left resize edge hit test"); Find<Button>(window, "WindowMaximize")!.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); await WaitAsync(() => window.WindowState == WindowState.Maximized); await WaitForCornersAsync(window); Assert(window.WindowState == WindowState.Maximized && NativeWindowCapture.HasExpectedCorners(window), "caption maximize with full rectangular work area"); Screenshot(window, Path.Combine(directory, "native-maximized.png")); Assert(NativeWindowCapture.FitsWorkArea(window, Find<Button>(window, "Send")!), "maximized composer remains within monitor work area"); Find<Button>(window, "WindowMaximize")!.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); await WaitAsync(() => window.WindowState == WindowState.Normal); await WaitForCornersAsync(window); Assert(window.WindowState == WindowState.Normal && NativeWindowCapture.HasExpectedCorners(window), "caption restore reinstates rounded corners"); Find<Button>(window, "WindowMinimize")!.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); await Task.Delay(120); Assert(window.WindowState == WindowState.Minimized, "caption minimize"); System.Windows.SystemCommands.RestoreWindow(window); await Task.Delay(120); checks.Add("Rounded main/media/dialog windows / maximize resets corners / restore reinstates rounding / native drag and resize hit tests");
         window.ChangeAppearance("zh", "dark"); window.Hide(); Assert((await native.InfoAsync()).ServerName == "邻传", "hide retains service"); window.Show();
         await VerifyTrayMenuAsync(window, directory); checks.Add("Themed tray popup while main window is hidden / green keyboard highlight / Escape and command callbacks");
         var settings = new SettingsStore(Path.Combine(options.ClientDir, "sessions.json")); var restored = await settings.LoadAsync(window.Target, native.Session.Device.Id); Assert(restored?.SessionToken == native.Session.Token, "DPAPI round-trip"); Assert(!File.ReadAllText(Path.Combine(options.ClientDir, "sessions.json")).Contains(native.Session.Token, StringComparison.Ordinal), "no plaintext persisted token"); checks.Add("DPAPI storage / close-to-tray retains service");
@@ -109,6 +112,19 @@ internal static class NativeVerification
     {
         window.UpdateLayout(); await window.Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.ContextIdle);
         await WaitAsync(() => NativeWindowCapture.HasExpectedCorners(window));
+        await WaitForRenderedFrameAsync(window);
+    }
+    private static async Task WaitForRenderedFrameAsync(Window window)
+    {
+        var rendered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); var frames = 0;
+        void Rendering(object? sender, EventArgs args) { if (++frames >= 2) rendered.TrySetResult(); }
+        CompositionTarget.Rendering += Rendering;
+        try
+        {
+            window.UpdateLayout(); window.InvalidateVisual(); await rendered.Task.WaitAsync(TimeSpan.FromSeconds(5)); await Task.Delay(160);
+            await window.Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.ContextIdle);
+        }
+        finally { CompositionTarget.Rendering -= Rendering; }
     }
     private static async Task VerifyHostHandoffAsync(MainWindow source, DesktopOptions options, LanClient phone, LanClient stranger, ChatMessage publicMessage, ChatMessage hiddenMessage, ChatMessage privateMessage, string directory)
     {
@@ -349,6 +365,45 @@ internal static class NativeVerification
             Screenshot(window, Path.Combine(directory, "native-copy-failure.png"));
         }
         finally { window.ClipboardWriter = writer; window.CopyCompleted -= Completed; window.ChangeAppearance("zh", "dark"); }
+    }
+    private static async Task VerifyComposerAttachmentsAsync(MainWindow window, LanClient phone, DesktopOptions options, string directory)
+    {
+        var existing = Clipboard.GetDataObject(); var snapshot = new DataObject();
+        if (existing is not null) foreach (var format in existing.GetFormats(false)) { var value = existing.GetData(format, false); if (value is not null) snapshot.SetData(format, value, false); }
+        var first = Path.Combine(directory, "qa-paste-first-" + Guid.NewGuid().ToString("N") + ".zip"); var second = Path.Combine(directory, "qa-paste-second-" + Guid.NewGuid().ToString("N") + ".zip");
+        var downloads = new[] { Path.Combine(directory, "qa-paste-download-1.bin"), Path.Combine(directory, "qa-paste-download-2.bin") };
+        try
+        {
+            var firstBytes = RandomNumberGenerator.GetBytes(32 * 1024 + 7); var secondBytes = RandomNumberGenerator.GetBytes(48 * 1024 + 11); await File.WriteAllBytesAsync(first, firstBytes); await File.WriteAllBytesAsync(second, secondBytes);
+            var composer = Find<TextBox>(window, "Composer")!; composer.Focus();
+            Clipboard.SetDataObject(new DataObject(DataFormats.FileDrop, new[] { first }), true); Assert(ApplicationCommands.Paste.CanExecute(null, composer), "FileDrop paste command is executable"); ApplicationCommands.Paste.Execute(null, composer); await WaitAsync(() => Find<Button>(window, "RemoveAttachment-0") is not null);
+            var before = window.Messages.Count; Clipboard.SetDataObject(new DataObject(DataFormats.FileDrop, new[] { second }), true); ApplicationCommands.Paste.Execute(null, composer); await WaitAsync(() => Find<Button>(window, "RemoveAttachment-1") is not null); Assert(window.Messages.Count == before, "repeated FileDrop paste does not auto-send");
+            var originalFirst = await File.ReadAllBytesAsync(first); var originalSecond = await File.ReadAllBytesAsync(second); Find<Button>(window, "RemoveAttachment-0")!.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); Assert(File.Exists(first) && (await File.ReadAllBytesAsync(first)).SequenceEqual(originalFirst), "removing attachment keeps source file");
+            Find<Button>(window, "RemoveAttachment-0")!.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); await WaitAsync(() => Find<Button>(window, "RemoveAttachment-0") is null); Clipboard.SetDataObject(new DataObject(DataFormats.FileDrop, new[] { first }), true); ApplicationCommands.Paste.Execute(null, composer); await WaitAsync(() => Find<Button>(window, "RemoveAttachment-0") is not null); Clipboard.SetDataObject(new DataObject(DataFormats.FileDrop, new[] { second }), true); ApplicationCommands.Paste.Execute(null, composer); await WaitAsync(() => Find<Button>(window, "RemoveAttachment-1") is not null);
+            composer.Text = "Draft survives attachment rebuild"; window.ChangeAppearance("en", "dark"); window.UpdateLayout(); await Task.Delay(120); composer = Find<TextBox>(window, "Composer")!; Assert(Find<Button>(window, "RemoveAttachment-0") is not null && Find<Button>(window, "RemoveAttachment-1") is not null, "attachments survive language/theme rebuild"); Assert(composer.Text == "Draft survives attachment rebuild", "composer draft survives attachment rebuild"); window.Width = 860; await WaitForRenderedFrameAsync(window); composer = Find<TextBox>(window, "Composer")!; var narrowComposerTop = composer.TranslatePoint(new Point(), window).Y; var narrowRemove = Find<Button>(window, "RemoveAttachment-0")!; Assert(narrowRemove.TranslatePoint(new Point(0, narrowRemove.ActualHeight), window).Y <= narrowComposerTop, "narrow attachment strip does not overlap input");
+            var narrowSend = Find<Button>(window, "Send")!; var narrowEntry = Find<Button>(window, "Entry")!; var narrowRoot = (FrameworkElement)window.Content;
+            await File.WriteAllTextAsync(Path.Combine(directory, "native-paste-layout.json"), JsonSerializer.Serialize(new { windowWidth = window.ActualWidth, rootWidth = narrowRoot.ActualWidth, rootDesiredWidth = narrowRoot.DesiredSize.Width, sendRight = narrowSend.TranslatePoint(new Point(narrowSend.ActualWidth, 0), window).X, entryRight = narrowEntry.TranslatePoint(new Point(narrowEntry.ActualWidth, 0), window).X }, new JsonSerializerOptions { WriteIndented = true }));
+            Assert(narrowSend.TranslatePoint(new Point(narrowSend.ActualWidth, 0), window).X <= window.ActualWidth && narrowEntry.TranslatePoint(new Point(narrowEntry.ActualWidth, 0), window).X <= window.ActualWidth, "narrow composer and connection controls stay inside window"); await WaitForRenderedFrameAsync(window); Screenshot(window, Path.Combine(directory, "native-paste-attachments-narrow.png")); window.Width = 1280; await WaitForRenderedFrameAsync(window);
+            var draftClient = window.Client; var draftTarget = window.Target;
+            _ = window.Dispatcher.BeginInvoke(() => Find<Button>(window, "Settings")!.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)));
+            await WaitAsync(() => Application.Current.Windows.OfType<AppWindow>().Any(dialog => dialog != window && dialog.Title == L.T("设备设置")));
+            var draftSettings = Application.Current.Windows.OfType<AppWindow>().Single(dialog => dialog != window && dialog.Title == L.T("设备设置"));
+            var switchDraftHost = Find<Button>(draftSettings, "SwitchHost")!; var draftLogout = Find<Button>(draftSettings, "Logout")!;
+            Assert(!switchDraftHost.IsEnabled && !draftLogout.IsEnabled, "pending draft disables host switch and logout");
+            draftLogout.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); Assert(window.Client == draftClient && draftClient!.Session is not null, "logout guard preserves pending draft session");
+            switchDraftHost.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); Assert(window.Client == draftClient && window.Target == draftTarget && !Application.Current.Windows.OfType<AppWindow>().Any(dialog => dialog != window && dialog.Title == L.T("连接你的设备")), "join guard cannot move pending draft to another service");
+            File.Delete(second); composer.Text = "First succeeds, second remains"; var enter = new KeyEventArgs(Keyboard.PrimaryDevice, PresentationSource.FromVisual(composer), 0, Key.Enter) { RoutedEvent = Keyboard.PreviewKeyDownEvent }; composer.RaiseEvent(enter); await WaitAsync(() => window.Messages.Any(view => view.Message.Text == "First succeeds, second remains")); await WaitAsync(() => window.Messages.Any(view => view.Message.File?.Name == Path.GetFileName(first))); await WaitAsync(() => Find<Button>(window, "RemoveAttachment-0") is { IsEnabled: true });
+            await File.WriteAllBytesAsync(second, originalSecond); Find<Button>(window, "Send")!.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); await WaitAsync(() => window.Messages.Count(view => view.Message.File?.Name == Path.GetFileName(second)) >= 1 && Find<Button>(window, "RemoveAttachment-0") is null); Assert(window.Messages.Count(view => view.Message.File?.Name == Path.GetFileName(first)) == 1, "successful first upload is not repeated on retry"); Assert(Find<Button>(window, "RemoveAttachment-0") is null, "successful retry clears remaining attachment");
+            var sentFiles = new[] { first, second }.Select(path => window.Messages.Last(view => view.Message.File?.Name == Path.GetFileName(path)).Message.File!).ToArray(); for (var index = 0; index < sentFiles.Length; index++) { await phone.DownloadAsync(sentFiles[index].Id, downloads[index]); var expected = index == 0 ? originalFirst : originalSecond; Assert(SHA256.HashData(await File.ReadAllBytesAsync(downloads[index])).SequenceEqual(SHA256.HashData(expected)), "pasted attachment download SHA256"); }
+            var messageCount = window.Messages.Count; Find<Button>(window, "Send")!.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); await Task.Delay(250); Assert(window.Messages.Count == messageCount, "repeated Send does not duplicate batch");
+            Clipboard.SetDataObject(new DataObject(DataFormats.UnicodeText, "ordinary pasted text"), true); ApplicationCommands.Paste.Execute(null, composer); Assert(composer.Text.Contains("ordinary pasted text", StringComparison.Ordinal), "ordinary text paste uses default TextBox behavior");
+            var cache = Path.Combine(options.ClientDir, "cache"); var beforeCache = Directory.Exists(cache) ? Directory.GetFiles(cache, "clipboard-*.png").ToHashSet(StringComparer.OrdinalIgnoreCase) : new HashSet<string>(StringComparer.OrdinalIgnoreCase); var visual = new DrawingVisual(); using (var context = visual.RenderOpen()) context.DrawRectangle(Brushes.SteelBlue, null, new Rect(0, 0, 24, 24)); var bitmap = new RenderTargetBitmap(24, 24, 96, 96, PixelFormats.Pbgra32); bitmap.Render(visual); var imageData = new DataObject(); imageData.SetData(DataFormats.Bitmap, bitmap); Clipboard.SetDataObject(imageData, true); ApplicationCommands.Paste.Execute(null, composer); await WaitAsync(() => (Directory.Exists(cache) ? Directory.GetFiles(cache, "clipboard-*.png").Except(beforeCache, StringComparer.OrdinalIgnoreCase).Any() : false)); var remove = Find<Button>(window, "RemoveAttachment-0")!; remove.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); await WaitAsync(() => !Directory.Exists(cache) || !Directory.GetFiles(cache, "clipboard-*.png").Except(beforeCache, StringComparer.OrdinalIgnoreCase).Any());
+        }
+        finally
+        {
+            foreach (var file in new[] { first, second }.Concat(downloads)) if (File.Exists(file)) File.Delete(file);
+            if (existing is null) Clipboard.Clear(); else Clipboard.SetDataObject(snapshot, true);
+        }
     }
     public static void Screenshot(Window window, string file) { window.UpdateLayout(); NativeWindowCapture.Save(window, file, ((AppWindow)window).CaptionResource); }
     private static async Task WaitAsync(Func<bool> condition) { var deadline = DateTime.UtcNow.AddSeconds(10); while (!condition()) { if (DateTime.UtcNow > deadline) throw new TimeoutException("Native QA condition timed out."); await Task.Delay(40); } }
