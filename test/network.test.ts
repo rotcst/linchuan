@@ -6,6 +6,73 @@ import os from 'node:os';
 import { createLanServer } from '../server/app.js';
 import { WebSocket } from 'ws';
 
+test('network public URL persists in metadata without enabling internet', async (t) => {
+  const dir = await fs.mkdtemp(`${os.tmpdir()}\\linchuan-network-public-`);
+  const first = createLanServer({
+    port: 0,
+    host: '127.0.0.1',
+    dataDir: dir,
+    joinCode: '123456',
+    publicUrl: 'https://transfer.example.test/path',
+  });
+  await first.start();
+  await first.close();
+  const second = createLanServer({
+    port: 0,
+    host: '127.0.0.1',
+    dataDir: dir,
+    joinCode: '123456',
+  });
+  t.after(async () => {
+    await second.close().catch(() => {});
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  await second.start();
+  const info = (await (
+    await fetch(`http://127.0.0.1:${second.getPort()}/api/info`)
+  ).json()) as { publicUrl: string; urls: string[] };
+  assert.equal(info.publicUrl, 'https://transfer.example.test');
+  assert.ok(info.urls.includes(info.publicUrl));
+});
+
+test('explicit public URL overrides metadata and empty value clears it', async (t) => {
+  const dir = await fs.mkdtemp(
+    `${os.tmpdir()}\\linchuan-network-public-clear-`,
+  );
+  let active: ReturnType<typeof createLanServer> | undefined;
+  t.after(async () => {
+    await active?.close().catch(() => {});
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const first = createLanServer({
+    port: 0,
+    host: '127.0.0.1',
+    dataDir: dir,
+    publicUrl: 'https://first.example.test',
+  });
+  await first.start();
+  await first.close();
+  active = createLanServer({
+    port: 0,
+    host: '127.0.0.1',
+    dataDir: dir,
+    publicUrl: 'https://second.example.test/path',
+  });
+  await active.start();
+  await active.close();
+  active = createLanServer({
+    port: 0,
+    host: '127.0.0.1',
+    dataDir: dir,
+    publicUrl: '',
+  });
+  await active.start();
+  const info = (await (
+    await fetch(`http://127.0.0.1:${active!.getPort()}/api/info`)
+  ).json()) as { publicUrl: string | null };
+  assert.equal(info.publicUrl, null);
+});
+
 test('network identity persists and probe signature binds group and nonce', async (t) => {
   const dir = await fs.mkdtemp(`${os.tmpdir()}\\linchuan-network-`);
   const first = createLanServer({

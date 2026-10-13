@@ -286,16 +286,26 @@ public sealed class MainWindow : AppWindow
     internal async Task JoinRemoteForVerificationAsync(string code, string name) { await Client!.JoinAsync(code, name, Guid.NewGuid().ToString("N"), Lifetime); await CompleteJoinAsync(); }
     internal Task AdvertiseForVerificationAsync() => _handoff.AdvertiseAsync(Client!, Lifetime);
     internal Task ReceiveHandoffForVerificationAsync() => _handoff.CheckIncomingAsync(Client!, Lifetime);
-    private async Task CompleteJoinAsync()
+    private async Task CompleteJoinAsync(string? hostDataDir = null, int? hostPort = null, GroupNetwork? expectedNetwork = null)
     {
         try { _host = await Client!.HostAsync(Lifetime); } catch (HttpRequestException) { _host = null; }
         if (_host is not null && _info?.DesktopApi >= 3) await Client!.HandoffApiAsync<System.Text.Json.JsonElement>("api/host/owner", new { deviceId = Client.Session!.Device.Id }, true, Lifetime);
         await Client!.RefreshNetworkAsync(Lifetime);
-        var session = Client.Session!; await _settings.SaveAsync(new DesktopSettings { ServerUri = Target, DeviceId = session.Device.Id, Name = session.Device.Name, SessionToken = session.Token, Network = Client.Network, AppDir = _options.AppDir, DataDir = _options.DataDir, Port = _options.Port }, Lifetime);
-        _preferences.Server = Target; _preferences.DeviceId = session.Device.Id; _preferences.Save(_options.ClientDir);
-        _preferences.Hosting = _host is not null; if (_preferences.Hosting == true) { _preferences.HostDataDir = _options.DataDir; _preferences.HostPort = _options.Port; } else await _backend.DisposeAsync(); _preferences.Save(_options.ClientDir);
-        if (Client.Network is not null && _options.VerifyOutput is null) { await _handoff.AdvertiseAsync(Client, Lifetime); _ = MonitorHandoffAsync(); }
+        if (expectedNetwork is not null)
+        {
+            var actual = Client.Network;
+            if (_host is null || _info?.GroupId != expectedNetwork.GroupId || _info.HostGeneration != expectedNetwork.HostGeneration || actual?.GroupId != expectedNetwork.GroupId || actual.PublicKey != expectedNetwork.PublicKey || actual.HostGeneration != expectedNetwork.HostGeneration || actual.HostDeviceId != expectedNetwork.HostDeviceId) throw new System.IO.InvalidDataException("设备组身份不一致。");
+            if (_info.PublicUrl != expectedNetwork.PublicUrl || _host.PublicUrl != expectedNetwork.PublicUrl || actual.PublicUrl != expectedNetwork.PublicUrl) throw new System.IO.InvalidDataException("公网通道地址与设备组不一致。");
+        }
         Build(); await Client.ConnectSocketAsync(Lifetime); await LoadHistoryAsync(false); await RefreshQrAsync();
+        if (Client.Network is not null && _options.VerifyOutput is null) await _handoff.AdvertiseAsync(Client, Lifetime);
+        // Persist the role only after the target, session and connection have been verified.
+        var dataDir = hostDataDir ?? _options.DataDir; var port = hostPort ?? _options.Port; var session = Client.Session!;
+        await _settings.SaveAsync(new DesktopSettings { ServerUri = Target, DeviceId = session.Device.Id, Name = session.Device.Name, SessionToken = session.Token, Network = Client.Network, AppDir = _options.AppDir, DataDir = dataDir, Port = port }, Lifetime);
+        var updated = new Preferences { Server = Target, DeviceId = session.Device.Id, Hosting = _host is not null, HostDataDir = _host is not null ? dataDir : _preferences.HostDataDir, HostPort = _host is not null ? port : _preferences.HostPort, Language = _preferences.Language, Theme = _preferences.Theme }; updated.Save(_options.ClientDir);
+        _options.DataDir = dataDir; _options.Port = port; _preferences.Server = updated.Server; _preferences.DeviceId = updated.DeviceId; _preferences.Hosting = updated.Hosting; _preferences.HostDataDir = updated.HostDataDir; _preferences.HostPort = updated.HostPort;
+        if (_host is null) await _backend.DisposeAsync();
+        if (Client.Network is not null && _options.VerifyOutput is null) _ = MonitorHandoffAsync();
     }
     private bool Matches(ChatMessage message) => _conversation == "all" ? message.To == "all" : message.To != "all" && (message.From == _conversation || message.To == _conversation);
     public async Task SelectConversationAsync(string id) { _conversation = id; _unread.Remove(id); UpdateHeading(); RenderDevices(); await LoadHistoryAsync(false); }
@@ -325,7 +335,7 @@ public sealed class MainWindow : AppWindow
         {
             try { await Task.Delay(3000, Lifetime); if (Client != client) break; await _handoff.CheckIncomingAsync(client, Lifetime); if (!_handoffBusy && Client == client) await _handoff.AdvertiseAsync(client, Lifetime); }
             catch (OperationCanceledException) when (Lifetime.IsCancellationRequested) { break; }
-            catch (Exception ex) when (ex is HttpRequestException or IOException or System.Security.Cryptography.CryptographicException or InvalidOperationException) { if (Client == client) _transfer.Text = L.T(ex.Message); }
+            catch (Exception ex) when (ex is HttpRequestException or IOException or UnauthorizedAccessException or System.Security.Cryptography.CryptographicException or InvalidOperationException) { if (Client == client) _transfer.Text = L.T(ex.Message); }
         }
     }
     public async Task TransferHostAsync(string deviceId)
@@ -340,21 +350,39 @@ public sealed class MainWindow : AppWindow
         var old = Client!; var session = old.Session!;
         var address = $"http://127.0.0.1:{pending.Offer.ReceivePort}";
         if (_host is not null && string.Equals(Path.GetFullPath(_options.DataDir), Path.GetFullPath(pending.DataDir), StringComparison.OrdinalIgnoreCase) && old.Network?.HostGeneration == pending.Offer.Generation && old.Network.HostDeviceId == session.Device.Id) return;
-        _preferences.Hosting = true; _preferences.HostDataDir = pending.DataDir; _preferences.HostPort = pending.Offer.ReceivePort; _preferences.Server = address; _preferences.DeviceId = session.Device.Id;
-        await _settings.SaveAsync(new DesktopSettings { ServerUri = address, DeviceId = session.Device.Id, Name = session.Device.Name, SessionToken = session.Token, Network = old.Network, DataDir = pending.DataDir, Port = pending.Offer.ReceivePort }, Lifetime); _preferences.Save(_options.ClientDir);
-        _options.DataDir = pending.DataDir; _options.Port = pending.Offer.ReceivePort;
-        await _backend.StartAsync(_options.AppDir, pending.DataDir, _options.Port, _options.LocalOnly, Lifetime);
-        _previousHandoffClient = old;
-        SetClient(address); Client!.UseNetwork(old.Network!); await Client.RestoreAsync(session.Token, Lifetime); _info = await Client.InfoAsync(Lifetime); _host = await Client.HostAsync(Lifetime); _entry = "";
-        await CompleteJoinAsync();
+        var expected = new GroupNetwork { Protocol = old.Network!.Protocol, GroupId = old.Network.GroupId, PublicKey = old.Network.PublicKey, HostGeneration = pending.Offer.Generation, HostDeviceId = session.Device.Id, PublicUrl = old.Network.PublicUrl };
+        HostHandoff.ValidatePublicConfiguration(pending.DataDir, expected.PublicUrl);
+        var started = await _backend.StartAsync(_options.AppDir, pending.DataDir, pending.Offer.ReceivePort, _options.LocalOnly, Lifetime, expected);
+        var previousTarget = Target; var previousInfo = _info; var previousHost = _host; var previousEntry = _entry;
+        try
+        {
+            _previousHandoffClient = old;
+            SetClient(address); Client!.UseNetwork(old.Network!); if (await Client.RestoreAsync(session.Token, Lifetime) is null) throw new System.IO.InvalidDataException("设备组身份不一致。");
+            _info = await Client.InfoAsync(Lifetime); _host = await Client.HostAsync(Lifetime); _entry = "";
+            await CompleteJoinAsync(pending.DataDir, pending.Offer.ReceivePort, expected);
+        }
+        catch
+        {
+            var failed = Client; Client = old; Target = previousTarget; _info = previousInfo; _host = previousHost; _entry = previousEntry; _previousHandoffClient = null;
+            if (failed is not null && failed != old) await failed.DisposeAsync(); if (started) await _backend.DisposeAsync(); Build(); throw;
+        }
         // The handoff controller still needs the old authenticated client for the final activation acknowledgement.
     }
     private async Task DemoteHostAsync(GroupNetwork network)
     {
         var old = Client!; var session = old.Session!; var address = network.LanUrls.FirstOrDefault(value => NetworkRoutes.IsPrivateLan(value) && new Uri(value).Scheme == "https") ?? network.PublicUrl ?? throw new InvalidDataException("新主机没有可用连接入口。");
-        _preferences.Hosting = false; _preferences.Server = address; _preferences.DeviceId = session.Device.Id; _preferences.Save(_options.ClientDir);
-        await _backend.DisposeAsync(); SetClient(address); Client!.UseNetwork(network); await Client.RestoreAsync(session.Token, Lifetime); _info = await Client.InfoAsync(Lifetime); _host = null; _entry = "";
-        await CompleteJoinAsync(); await old.DisposeAsync();
+        var previousTarget = Target; var previousInfo = _info; var previousHost = _host; var previousEntry = _entry;
+        try
+        {
+            SetClient(address); Client!.UseNetwork(network); if (await Client.RestoreAsync(session.Token, Lifetime) is null) throw new System.IO.InvalidDataException("设备组身份不一致。");
+            _info = await Client.InfoAsync(Lifetime); _host = null; _entry = ""; await CompleteJoinAsync();
+        }
+        catch
+        {
+            var failed = Client; Client = old; Target = previousTarget; _info = previousInfo; _host = previousHost; _entry = previousEntry;
+            if (failed is not null && failed != old) await failed.DisposeAsync(); Build(); throw;
+        }
+        await old.DisposeAsync();
     }
     public async Task LoadHistoryAsync(bool older = false)
     {

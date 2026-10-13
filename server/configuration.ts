@@ -4,9 +4,12 @@ import path from 'node:path';
 // The saved configuration is the source of the public entry even when the
 // tunnel is disabled. Do not depend on a launcher exporting PUBLIC_URL.
 export function readPublicUrl(dataDir: string, environmentUrl?: string) {
-  let value: unknown = environmentUrl?.trim() || undefined;
+  let value: unknown =
+    environmentUrl === undefined ? undefined : environmentUrl.trim();
+  let fromFile = false;
   try {
     const text = fs.readFileSync(path.join(dataDir, 'cloudflare.json'), 'utf8');
+    fromFile = true;
     const configuration = JSON.parse(text.replace(/^\uFEFF/, '')) as {
       publicUrl?: unknown;
     };
@@ -18,6 +21,7 @@ export function readPublicUrl(dataDir: string, environmentUrl?: string) {
       });
   }
   if (value === undefined) return undefined;
+  if (value === '' && !fromFile) return '';
   if (typeof value !== 'string')
     throw new Error('公网入口配置必须包含有效的 HTTPS 地址。');
   let url: URL;

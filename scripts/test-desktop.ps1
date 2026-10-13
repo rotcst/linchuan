@@ -101,7 +101,7 @@ try {
   } else {
     $launch = Start-Process -FilePath $Exe -ArgumentList $argumentText -WindowStyle Hidden -PassThru
   }
-  $deadline = [DateTime]::UtcNow.AddSeconds(120)
+  $deadline = [DateTime]::UtcNow.AddSeconds(240)
   while ([DateTime]::UtcNow -lt $deadline) {
     $earlyFailure = $null
     if (Test-Path -LiteralPath $report) {

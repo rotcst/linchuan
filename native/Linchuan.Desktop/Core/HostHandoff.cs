@@ -69,9 +69,33 @@ public sealed class HostHandoff : IAsyncDisposable
     }
     public async Task<HandoffPending?> LoadPendingAsync(CancellationToken ct)
     {
-        SafePath(_pendingFile); if (!File.Exists(_pendingFile)) return null;
-        if (new FileInfo(_pendingFile).Length > 65536) throw new InvalidDataException("主机移交状态无效。");
-        return JsonSerializer.Deserialize<HandoffPending>(await File.ReadAllTextAsync(_pendingFile, ct), Json) ?? throw new InvalidDataException("主机移交状态无效。");
+        return await LoadPendingAsync(Path.GetDirectoryName(_pendingFile)!, ct);
+    }
+    public static async Task<HandoffPending?> LoadPendingAsync(string clientDir, CancellationToken ct)
+    {
+        var path = Path.Combine(Path.GetFullPath(clientDir), "handoff-pending.json");
+        SafePath(path); if (!File.Exists(path)) return null;
+        if (new FileInfo(path).Length > 65536) throw new InvalidDataException("主机移交状态无效。");
+        return JsonSerializer.Deserialize<HandoffPending>(await File.ReadAllTextAsync(path, ct), Json) ?? throw new InvalidDataException("主机移交状态无效。");
+    }
+    public static void ValidatePendingForStartup(HandoffPending pending, GroupNetwork expected, string storageRoot)
+    {
+        if (pending.Offer is null || pending.Offer.Generation < 1 || string.IsNullOrWhiteSpace(pending.Offer.TargetDeviceId) || pending.Offer.TargetDeviceId.Length > 128)
+            throw new InvalidDataException("主机移交状态无效。");
+        VerifyOffer(pending.Offer, expected);
+        if (pending.Outgoing)
+        {
+            if (pending.Offer.Generation != expected.HostGeneration && pending.Offer.Generation != expected.HostGeneration + 1)
+                throw new InvalidDataException("主机移交状态无效。");
+            return;
+        }
+        if (pending.Offer.Generation != expected.HostGeneration && pending.Offer.Generation != expected.HostGeneration + 1)
+            throw new InvalidDataException("主机移交状态无效。");
+        var root = Path.GetFullPath(storageRoot); SafePath(root);
+        var expectedData = Path.Combine(root, "groups", pending.Offer.GroupId + "-" + pending.Offer.Generation);
+        if (!string.Equals(Path.GetFullPath(pending.DataDir), expectedData, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("移交目录越界。");
+        SafePath(expectedData);
     }
     public async Task CheckIncomingAsync(LanClient client, CancellationToken ct)
     {
@@ -123,6 +147,7 @@ public sealed class HostHandoff : IAsyncDisposable
                 }
                 if (received != offer.TotalBytes || Convert.ToHexStringLower(hash.GetHashAndReset()) != offer.Sha256) throw new InvalidDataException("移交密文校验失败。");
                 await ExtractBundleAsync(bundle, stage, offer, ct);
+                if (client.Network.PublicUrl is { Length: > 0 } && envelope.CredentialCipher is not { Length: > 0 }) throw new InvalidDataException("公网通道凭据缺失，无法完整移交。");
                 if (envelope.CredentialCipher is { Length: > 0 } cipher)
                 {
                     var credential = Decrypt(Convert.FromBase64String(cipher), key, prefix, offer, uint.MaxValue);
@@ -139,6 +164,7 @@ public sealed class HostHandoff : IAsyncDisposable
                     }
                     finally { CryptographicOperations.ZeroMemory(credential); }
                 }
+                ValidatePublicConfiguration(stage, client.Network.PublicUrl);
                 File.Delete(bundle);
                 var pending = new HandoffPending { Offer = offer, DataDir = destination, Source = source.AbsoluteUri };
                 await SavePendingAsync(pending, ct);
@@ -157,6 +183,9 @@ public sealed class HostHandoff : IAsyncDisposable
         try
         {
             if (client.Network is null || !client.ActiveUri.IsLoopback) throw new InvalidOperationException("此功能只能在服务电脑本机使用。");
+            // Read the actual host, rather than silently trusting a stale route cache.
+            client.UseNetwork(await client.HandoffApiAsync<GroupNetwork>("api/network", ct: ct, host: true));
+            ValidatePublicConfiguration(activeDataDir, client.Network!.PublicUrl);
             _progress("正在准备主机移交…");
             offer = await client.HandoffApiAsync<HandoffOffer>("api/host/handoff/prepare", new { targetDeviceId }, true, ct);
             if (offer.GroupId != client.Network.GroupId || offer.Generation != client.Network.HostGeneration + 1 || offer.TargetDeviceId != targetDeviceId) throw new InvalidDataException("主机移交状态无效。");
@@ -196,7 +225,10 @@ public sealed class HostHandoff : IAsyncDisposable
                 await client.HandoffApiAsync<JsonElement>("api/host/handoff/seal", new { id = offer.Id, envelopeJson = JsonSerializer.Serialize(envelope, Json), totalChunks = index, totalBytes, sha256 = Convert.ToHexStringLower(hash.GetHashAndReset()) }, true, ct);
             }
             finally { CryptographicOperations.ZeroMemory(key); }
-            var pending = new HandoffPending { Offer = offer, Source = client.ActiveUri.AbsoluteUri, Outgoing = true };
+            var sealedOffer = await client.HandoffApiAsync<HandoffOffer>("api/host/handoff/status?id=" + offer.Id, ct: ct, host: true);
+            if (sealedOffer.State is not ("offered" or "sealed" or "ready") || sealedOffer.Id != offer.Id || sealedOffer.Generation != offer.Generation || sealedOffer.TargetDeviceId != offer.TargetDeviceId) throw new InvalidDataException("主机移交状态无效。");
+            VerifyOffer(sealedOffer, client.Network);
+            var pending = new HandoffPending { Offer = sealedOffer, Source = client.ActiveUri.AbsoluteUri, Outgoing = true };
             await SavePendingAsync(pending, ct);
             while (true)
             {
@@ -221,6 +253,7 @@ public sealed class HostHandoff : IAsyncDisposable
         SafePath(pending.DataDir); if (!pending.DataDir.StartsWith(_root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("移交目录越界。");
         var source = new Uri(pending.Source); if (!NetworkRoutes.IsPrivateLan(source.AbsoluteUri) || source.Scheme != "https") throw new InvalidDataException("移交来源地址无效。");
         RestoreImportDirectory(_root, pending);
+        ValidatePublicConfiguration(pending.DataDir, client.Network?.PublicUrl);
         while (true)
         {
             HandoffOffer state;
@@ -238,6 +271,15 @@ public sealed class HostHandoff : IAsyncDisposable
     }
     private async Task FinishOutgoingAsync(LanClient client, HandoffPending pending, CancellationToken ct)
     {
+        // A crash can leave the outgoing marker after the verified client role was saved.
+        if (!client.ActiveUri.IsLoopback)
+        {
+            await client.RefreshNetworkAsync(ct);
+            var network = client.Network ?? throw new InvalidDataException("设备组身份不一致。");
+            VerifyOffer(pending.Offer, network);
+            if (network.GroupId != pending.Offer.GroupId || network.HostGeneration != pending.Offer.Generation || network.HostDeviceId != pending.Offer.TargetDeviceId) throw new InvalidDataException("设备组身份不一致。");
+            DeletePending(); _progress("主机移交完成"); return;
+        }
         while (true)
         {
             HandoffOffer state;
@@ -303,6 +345,18 @@ public sealed class HostHandoff : IAsyncDisposable
     public static void SafePath(string path)
     {
         for (var current = Path.GetFullPath(path); !string.IsNullOrEmpty(current); current = Path.GetDirectoryName(current)) if ((Directory.Exists(current) || File.Exists(current)) && (File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0) throw new InvalidDataException("移交路径不能包含 reparse point。");
+    }
+    public static void ValidatePublicConfiguration(string dataDir, string? expectedPublicUrl)
+    {
+        var configPath = Path.Combine(dataDir, "cloudflare.json"); var tokenPath = Path.Combine(dataDir, "tunnel-token.dpapi"); SafePath(configPath); SafePath(tokenPath);
+        var configured = BackendHost.ReadPublicUrl(dataDir);
+        if (!string.Equals(configured, expectedPublicUrl, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("公网通道地址与设备组不一致。");
+        if (expectedPublicUrl is not { Length: > 0 }) return;
+        if (!NetworkRoutes.IsPublicHttps(expectedPublicUrl) || !File.Exists(configPath) || !File.Exists(tokenPath)) throw new InvalidDataException("公网通道凭据缺失，无法完整移交。");
+        if (new FileInfo(tokenPath).Length is < 1 or > 16384) throw new InvalidDataException("公网通道凭据缺失，无法完整移交。");
+        var token = ProtectedData.Unprotect(File.ReadAllBytes(tokenPath), null, DataProtectionScope.CurrentUser);
+        try { if (token.Length == 0) throw new InvalidDataException("公网通道凭据缺失，无法完整移交。"); }
+        finally { CryptographicOperations.ZeroMemory(token); }
     }
     public static void RestoreImportDirectory(string root, HandoffPending pending)
     {

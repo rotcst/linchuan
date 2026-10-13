@@ -13,7 +13,7 @@ public sealed class BackendHost : IAsyncDisposable
     private string? _dataDir;
     private int _port;
 
-    public async Task<bool> StartAsync(string appDir, string dataDir, int port, bool localOnly, CancellationToken ct = default)
+    public async Task<bool> StartAsync(string appDir, string dataDir, int port, bool localOnly, CancellationToken ct = default, GroupNetwork? expectedNetwork = null, HandoffPending? pendingHandoff = null)
     {
         if (port is < 1 or > 65535) throw new ArgumentOutOfRangeException(nameof(port));
         appDir = Path.GetFullPath(appDir); dataDir = Path.GetFullPath(dataDir);
@@ -22,7 +22,14 @@ public sealed class BackendHost : IAsyncDisposable
         var configuredPublicUrl = ReadPublicUrl(dataDir);
         if (configuredPublicUrl is null && File.Exists(Path.Combine(dataDir, "cloudflare.json")))
             throw new InvalidOperationException("无法读取公网入口配置，请检查 cloudflare.json。");
-        var existing = await ProbeAsync(port, configuredPublicUrl, ct);
+        if (pendingHandoff is not null)
+        {
+            if (expectedNetwork is null) throw new InvalidDataException("设备组身份不一致。");
+            if (!pendingHandoff.Outgoing && !string.Equals(Path.GetFullPath(pendingHandoff.DataDir), dataDir, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("主机移交状态无效。");
+            var storageRoot = pendingHandoff.Outgoing ? dataDir : Path.GetDirectoryName(Path.GetDirectoryName(dataDir)) ?? throw new InvalidDataException("移交目录越界。");
+            HostHandoff.ValidatePendingForStartup(pendingHandoff, expectedNetwork, storageRoot);
+        }
+        var existing = await ProbeAsync(port, configuredPublicUrl, ct, expectedNetwork, pendingHandoff);
         if (existing == true) return false;
         if (existing is null) throw new InvalidOperationException("目标端口已被其他服务占用。");
         var payload = FindPayload();
@@ -60,7 +67,7 @@ public sealed class BackendHost : IAsyncDisposable
             {
                 ct.ThrowIfCancellationRequested();
                 if (process.HasExited) throw new InvalidOperationException("后端进程提前退出。");
-                if (await ProbeAsync(port, configuredPublicUrl, ct) == true) return true;
+                if (await ProbeAsync(port, configuredPublicUrl, ct, expectedNetwork, pendingHandoff) == true) return true;
                 await Task.Delay(200, ct);
             }
             throw new TimeoutException("后端启动超时。");
@@ -188,7 +195,7 @@ public sealed class BackendHost : IAsyncDisposable
         }
     }
 
-    private static async Task<bool?> ProbeAsync(int port, string? configuredPublicUrl, CancellationToken ct)
+    private static async Task<bool?> ProbeAsync(int port, string? configuredPublicUrl, CancellationToken ct, GroupNetwork? expectedNetwork, HandoffPending? pendingHandoff)
     {
         using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
         try
@@ -199,6 +206,9 @@ public sealed class BackendHost : IAsyncDisposable
             if (info.DesktopApi < 3) throw new InvalidOperationException("旧版服务仍在运行，请先退出旧版邻传，再启动桌面程序。数据会保留。");
             if (!string.Equals(info.PublicUrl, configuredPublicUrl, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("现有服务的公网入口配置与当前桌面配置不一致，请先退出现有邻传服务，再启动桌面程序。数据会保留。");
+            var generationAllowed = expectedNetwork is null || pendingHandoff is null && info.HostGeneration == expectedNetwork.HostGeneration || pendingHandoff is { Outgoing: true } && (info.HostGeneration == expectedNetwork.HostGeneration || info.HostGeneration == pendingHandoff.Offer.Generation) || pendingHandoff is { Outgoing: false } && info.HostGeneration == pendingHandoff.Offer.Generation;
+            if (expectedNetwork is not null && (info.GroupId != expectedNetwork.GroupId || !generationAllowed))
+                throw new InvalidOperationException("现有服务不属于本次移交的设备组，请先退出该服务再重试。数据会保留。");
             return true;
         }
         catch (HttpRequestException) { return false; }
@@ -212,7 +222,7 @@ public sealed class BackendHost : IAsyncDisposable
         return name is null ? null : asm.GetManifestResourceStream(name);
     }
     private static void AppendLine(string path, string? line) { if (line is null) return; try { File.AppendAllText(path, line + Environment.NewLine); } catch { } }
-    private static string? ReadPublicUrl(string dataDir)
+    public static string? ReadPublicUrl(string dataDir)
     {
         try
         {

@@ -38,7 +38,16 @@ public static class App
                 try
                 {
                     var saved = Preferences.Load(options.ClientDir); L.Set(saved.Language);
-                    if (options.ServerUri is null) await host.StartAsync(options.AppDir, options.DataDir, options.Port, options.LocalOnly, life.Token);
+                    if (options.ServerUri is null)
+                    {
+                        var pending = await HostHandoff.LoadPendingAsync(options.ClientDir, life.Token);
+                        var stored = saved.Hosting == true && saved.Server.Length > 0 && saved.DeviceId.Length > 0 ? await new SettingsStore(Path.Combine(options.ClientDir, "sessions.json")).LoadAsync(saved.Server, saved.DeviceId, life.Token) : null;
+                        if (pending is not null && stored?.Network is null) throw new InvalidDataException("设备组身份不一致。");
+                        if (pending is not null && !pending.Outgoing && pending.Offer.TargetDeviceId != saved.DeviceId) throw new InvalidDataException("设备组身份不一致。");
+                        if (pending is not null && !pending.Outgoing && !string.Equals(Path.GetFullPath(options.DataDir), Path.GetFullPath(pending.DataDir), StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("主机移交状态无效。");
+                        if (pending is not null) HostHandoff.ValidatePendingForStartup(pending, stored!.Network!, options.StorageRoot.Length > 0 ? options.StorageRoot : options.DataDir);
+                        await host.StartAsync(options.AppDir, options.DataDir, options.Port, options.LocalOnly, life.Token, stored?.Network, pending);
+                    }
                     window = new MainWindow(options, host); application.MainWindow = window; window.ExitRequested += async () => await StopAsync(); window.Show();
                     if (options.VerifyOutput is not null) { await NativeVerification.RunAsync(window, options); await StopAsync(); return; }
                     using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("assets.app.ico");

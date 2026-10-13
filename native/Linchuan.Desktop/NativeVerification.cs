@@ -100,7 +100,7 @@ internal static class NativeVerification
         VerifyCopy(window, Find<Button>(window, "CopyAddress")!, Find<TextBox>(window, "Address")!.Text, "地址已复制");
         VerifyCopy(window, Find<Button>(window, "CopyCode")!, (await native.HostAsync()).Code, "连接码已复制");
         await VerifyCopyFeedbackAsync(window, sent, directory); checks.Add("Copy feedback: actual clipboard / all copy entries / four languages and themes / stable width and focus / rapid repeat and reset / empty and clipboard failure");
-        await VerifyHostHandoffAsync(window, options, phone, stranger, sent, incoming, privateMessage, directory); checks.Add("Two actual WPF clients / right-click full encrypted host transfer / sealed receiver restart / source demotion / group and device identities / private ACL and hidden history / 9 MiB SHA256 / synthetic tunnel credential re-protection / new-host address and QR on both clients");
+        await VerifyHostHandoffAsync(window, options, phone, stranger, sent, incoming, privateMessage, directory); checks.Add("Two actual WPF clients / complete encrypted host transfer / failed activation retains previous role and retry recovers / sealed receiver and activated host restart / identities and ACL / 9 MiB SHA256 / synthetic credential re-protection / public domain in APIs and both menus with correct QR after restart");
         await Task.Delay(300); GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect(); await Task.Delay(200);
         await File.WriteAllTextAsync(options.VerifyOutput!, JsonSerializer.Serialize(new { passed = true, checks, elapsedMs = watch.ElapsedMilliseconds, initialWorkingSetBytes, peakWorkingSetBytes, afterQaGcWorkingSetBytes = Process.GetCurrentProcess().WorkingSet64, nativeWpf = true, browserOrWebView = false, packagedProcess = NativeWindowCapture.IsPackagedProcess }, new JsonSerializerOptions { WriteIndented = true }));
     }
@@ -120,7 +120,8 @@ internal static class NativeVerification
         var targetOptions = new DesktopOptions { AppDir = Path.Combine(targetRoot, "app"), DataDir = Path.Combine(targetRoot, "data"), StorageRoot = Path.Combine(targetRoot, "data"), ClientDir = Path.Combine(targetRoot, "desktop"), ServerUri = lan, VerifyOutput = options.VerifyOutput, LocalOnly = true };
         for (var attempt = 0; ; attempt++) { var port = new System.Net.Sockets.TcpListener(IPAddress.Any, 0); port.Start(); targetOptions.Port = ((IPEndPoint)port.LocalEndpoint).Port; var securePort = new System.Net.Sockets.TcpListener(IPAddress.Any, targetOptions.Port == 65535 ? 65534 : targetOptions.Port + 1); try { securePort.Start(); break; } catch (System.Net.Sockets.SocketException) when (attempt < 10) { } finally { securePort.Stop(); port.Stop(); } }
         ManagedPaths.Create(targetOptions.ClientDir); await using var targetBackend = new BackendHost(); var target = new MainWindow(targetOptions, targetBackend);
-        using var receiving = new CancellationTokenSource(TimeSpan.FromSeconds(90)); Task? receiver = null;
+        using var receiving = new CancellationTokenSource(TimeSpan.FromSeconds(150)); Task? receiver = null;
+        HandoffPending? savedOutgoingForRestart = null;
         var fakeToken = System.Text.Encoding.UTF8.GetBytes("synthetic-qa-token-" + Guid.NewGuid().ToString("N"));
         try
         {
@@ -134,25 +135,48 @@ internal static class NativeVerification
             var menu = Find<Button>(source, "Device-" + targetId)!.ContextMenu!; var transfer = menu.Items.OfType<MenuItem>().Single(); Assert(transfer.IsEnabled && (string)transfer.Header == L.T("转移服务主机"), "host transfer context command");
             transfer.RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
             Stage("Context command invoked");
-            var deadline = DateTime.UtcNow.AddSeconds(90);
+            var deadline = DateTime.UtcNow.AddSeconds(150);
             var previousProgress = "";
-            while (source.Client == original || source.HostTransferBusy) { var progress = source.VerificationHandoffProgress + " / " + target.VerificationHandoffProgress; if (progress != previousProgress) { Stage(progress); previousProgress = progress; } if (receiver.IsFaulted) await receiver; if (!source.HostTransferBusy && source.VerificationError.Length > 0) throw new InvalidOperationException(source.VerificationError); if (DateTime.UtcNow > deadline) throw new TimeoutException("WPF host migration timed out: " + source.VerificationError); await Task.Delay(100); }
+            while (source.Client == original || source.HostTransferBusy) { var progress = source.VerificationHandoffProgress + " / " + target.VerificationHandoffProgress; if (progress != previousProgress) { Stage(progress); previousProgress = progress; } if (receiver.IsFaulted) { Stage("Receiver failed; source error=" + source.VerificationError + "; source progress=" + source.VerificationHandoffProgress); await receiver; } if (!source.HostTransferBusy && source.VerificationError.Length > 0) throw new InvalidOperationException(source.VerificationError); if (DateTime.UtcNow > deadline) throw new TimeoutException("WPF host migration timed out: " + source.VerificationError); await Task.Delay(100); }
             Stage("Source demoted");
             await receiver; receiving.Cancel();
+            Stage("Receiver activation completed");
             var newNetwork = target.Client!.Network!; Assert(newNetwork.GroupId == network.GroupId && newNetwork.PublicKey == network.PublicKey && newNetwork.HostGeneration == network.HostGeneration + 1 && newNetwork.HostDeviceId == targetId, "same group and monotonic host generation");
+            Assert(network.PublicUrl == "https://transfer.example.test" && newNetwork.PublicUrl == network.PublicUrl, "public domain remains part of migrated group");
             Assert(source.Client!.Session!.Device.Id == sourceId && !source.Client.ActiveUri.IsLoopback && source.Client.ActiveUri.Scheme == "https", "old host demoted to pinned TLS client");
             phone.UseNetwork(newNetwork); stranger.UseNetwork(newNetwork); await phone.RefreshNetworkAsync(); await stranger.RefreshNetworkAsync(); await phone.ConnectSocketAsync();
+            Stage("Other clients reconnected");
             Assert((await source.Client.HistoryAsync()).Messages.Any(message => message.Id == publicMessage.Id), "public chat migrated");
             Assert(!(await source.Client.HistoryAsync()).Messages.Any(message => message.Id == hiddenMessage.Id) && (await phone.HistoryAsync()).Messages.Any(message => message.Id == hiddenMessage.Id), "per-device hidden history migrated");
             Assert((await phone.HistoryAsync(sourceId)).Messages.Any(message => message.Id == privateMessage.Id) && !(await stranger.HistoryAsync(sourceId)).Messages.Any(message => message.Id == privateMessage.Id), "migrated private ACL");
             Assert(SHA256.HashData(await phone.GetBytesAsync("api/files/" + file.Id, 12 * 1024 * 1024)).SequenceEqual(hash), "migrated binary SHA256");
+            Stage("Migrated history, ACL and file checked");
             var protectedToken = await File.ReadAllBytesAsync(Path.Combine(targetOptions.DataDir, "tunnel-token.dpapi")); var plain = ProtectedData.Unprotect(protectedToken, null, DataProtectionScope.CurrentUser);
             try { Assert(plain.SequenceEqual(fakeToken) && !protectedToken.SequenceEqual(fakeToken), "tunnel token decrypted then re-protected on destination"); } finally { CryptographicOperations.ZeroMemory(plain); }
             Assert(!File.Exists(Path.Combine(options.ClientDir, "handoff-pending.json")) && !File.Exists(Path.Combine(targetOptions.ClientDir, "handoff-pending.json")), "completed migration clears pending states");
+            Assert(savedOutgoingForRestart is not null, "signed outgoing recovery state captured");
+            await File.WriteAllTextAsync(Path.Combine(options.ClientDir, "handoff-pending.json"), JsonSerializer.Serialize(savedOutgoingForRestart, new JsonSerializerOptions(JsonSerializerDefaults.Web)));
+            await source.ReceiveHandoffForVerificationAsync();
+            Assert(!File.Exists(Path.Combine(options.ClientDir, "handoff-pending.json")) && Preferences.Load(options.ClientDir).Hosting == false, "client-role restart verifies the new group and retires its signed outgoing marker");
             var targetEntry = Find<TextBox>(target, "Address")!.Text; var sourceEntry = Find<TextBox>(source, "Address")!.Text;
             Assert(new Uri(targetEntry).Port == targetOptions.Port && sourceEntry == targetEntry, "both connection panels point to the new host");
             Assert(Find<Button>(source, "CopyCode") is null && Find<Button>(source, "RefreshCode") is null && Find<Button>(target, "CopyCode") is not null, "only the service host offers code management");
             await VerifyQrAsync(target, target.Client!, targetEntry); await VerifyQrAsync(source, source.Client!, sourceEntry);
+            Stage("LAN entries and QR checked");
+            await VerifyMigratedPublicEntryAsync(target, target.Client!, network.PublicUrl!);
+            await VerifyMigratedPublicEntryAsync(source, source.Client!, network.PublicUrl!);
+            Stage("Public entries and QR checked on both clients");
+            var importedConfig = await File.ReadAllTextAsync(Path.Combine(targetOptions.DataDir, "cloudflare.json"));
+            using (var config = JsonDocument.Parse(importedConfig)) Assert(config.RootElement.GetProperty("publicUrl").GetString() == network.PublicUrl, "domain configuration restored in active generation directory");
+            // Restart the activated service and window, not just the sealed receiver.
+            await target.ShutdownAsync(); await targetBackend.DisposeAsync(); targetOptions.ServerUri = null;
+            Stage("Activated host stopped for restart check");
+            await targetBackend.StartAsync(targetOptions.AppDir, targetOptions.DataDir, targetOptions.Port, true, expectedNetwork: newNetwork);
+            target = new MainWindow(targetOptions, targetBackend); target.Show(); await target.ReadyTask;
+            Stage("Activated host restarted");
+            Assert(target.Client!.Session?.Device.Id == targetId && target.Client.Network?.HostGeneration == newNetwork.HostGeneration, "activated host restart preserves owner and generation");
+            await VerifyMigratedPublicEntryAsync(target, target.Client, network.PublicUrl!);
+            await VerifyMigratedPublicEntryAsync(source, source.Client!, network.PublicUrl!);
             await source.SendTextAsync("After handoff → new host"); await WaitAsync(() => target.Messages.Any(view => view.Message.Text == "After handoff → new host"));
             Screenshot(target, Path.Combine(directory, "native-handoff-new-host.png")); Screenshot(source, Path.Combine(directory, "native-handoff-old-client.png"));
             async Task ReceiveAsync()
@@ -161,10 +185,46 @@ internal static class NativeVerification
                 while (true) { try { if ((await target.Client!.HandoffApiAsync<HandoffInbox>("api/handoff/inbox", ct: receiving.Token)).Offer?.State == "sealed") break; } catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.NotFound) { } await Task.Delay(300, receiving.Token); }
                 await target.ShutdownAsync(); target = new MainWindow(targetOptions, targetBackend); target.Show(); await target.ReadyTask;
                 Assert(target.Client!.Session?.Device.Id == targetId, "receiver restart preserves target identity"); Stage("Sealed receiver restarted with DPAPI key");
-                while (!receiving.IsCancellationRequested) { await target.ReceiveHandoffForVerificationAsync(); if (target.Client!.ActiveUri.IsLoopback && target.Client.Network?.HostGeneration == network.HostGeneration + 1) return; await target.AdvertiseForVerificationAsync(); await Task.Delay(300, receiving.Token); }
+                var oldClient = target.Client; var oldDataDir = targetOptions.DataDir; var oldPort = targetOptions.Port;
+                var preferencesPath = Path.Combine(targetOptions.ClientDir, "ui.json"); var preferencesBefore = await File.ReadAllTextAsync(preferencesPath); var attributes = File.GetAttributes(preferencesPath); var retried = false;
+                // A real filesystem failure at the last persistence step must not change the role.
+                File.SetAttributes(preferencesPath, attributes | FileAttributes.ReadOnly);
+                try
+                {
+                    while (!receiving.IsCancellationRequested)
+                    {
+                        try { Stage(retried ? "Retry activation started" : "Initial activation started"); await target.ReceiveHandoffForVerificationAsync(); Stage("Activation and acknowledgement returned"); }
+                        catch (Exception ex) when (!retried && (ex is IOException or UnauthorizedAccessException) && ex.StackTrace?.Contains(typeof(Preferences).FullName + ".Save", StringComparison.Ordinal) == true)
+                        {
+                            Assert(await File.ReadAllTextAsync(preferencesPath) == preferencesBefore && target.Client == oldClient && targetOptions.DataDir == oldDataDir && targetOptions.Port == oldPort, "failed activation leaves saved role, live client and data directory unchanged");
+                            Assert(File.Exists(Path.Combine(targetOptions.ClientDir, "handoff-pending.json")), "failed activation keeps pending transfer for retry");
+                            var sourcePreferences = Preferences.Load(options.ClientDir);
+                            var savedSource = await new SettingsStore(Path.Combine(options.ClientDir, "sessions.json")).LoadAsync(sourcePreferences.Server, sourcePreferences.DeviceId, receiving.Token);
+                            var savedTransfer = await HostHandoff.LoadPendingAsync(options.ClientDir, receiving.Token);
+                            savedOutgoingForRestart = savedTransfer;
+                            Assert(savedSource?.Network?.HostGeneration == network.HostGeneration && savedTransfer is { Outgoing: true } && savedTransfer.Offer.Generation == network.HostGeneration + 1, "committed transfer retains old saved generation and signed pending generation");
+                            await using (var startupProbe = new BackendHost()) Assert(!await startupProbe.StartAsync(options.AppDir, options.DataDir, options.Port, true, receiving.Token, savedSource!.Network, savedTransfer), "startup can resume the actual committed source without accepting another group");
+                            File.SetAttributes(preferencesPath, attributes); retried = true; Stage("Persistence failure retained previous role; retrying committed transfer"); continue;
+                        }
+                        if (target.Client!.ActiveUri.IsLoopback && target.Client.Network?.HostGeneration == network.HostGeneration + 1) { Assert(retried, "activation retry fault was exercised"); return; }
+                        await target.AdvertiseForVerificationAsync(); await Task.Delay(300, receiving.Token);
+                    }
+                }
+                finally { File.SetAttributes(preferencesPath, attributes); }
             }
         }
         finally { receiving.Cancel(); var shutdown = target.ShutdownAsync(); if (receiver is not null) { try { await receiver; } catch (OperationCanceledException) { } } await shutdown; CryptographicOperations.ZeroMemory(fakeToken); }
+    }
+    private static async Task VerifyMigratedPublicEntryAsync(MainWindow window, LanClient client, string domain)
+    {
+        var info = await client.InfoAsync(); Assert(info.PublicUrl == domain && info.Urls.Contains(domain), "migrated service API advertises public domain");
+        await client.RefreshNetworkAsync(); Assert(client.Network?.PublicUrl == domain, "migrated authenticated routes retain public domain");
+        if (client.ActiveUri.IsLoopback) { var host = await client.HostAsync(); Assert(host.PublicUrl == domain && host.Internet == "disabled", "domain entry and tunnel status are independent"); }
+        var menu = Find<Button>(window, "Entry")!.ContextMenu!; var previous = Find<TextBox>(window, "Address")!.Text;
+        var entries = menu.Items.OfType<MenuItem>().Select(item => (string)item.Header).ToArray(); Assert(entries.Count(entry => entry == domain) == 1, "public domain remains visible exactly once in connection menu");
+        menu.Items.OfType<MenuItem>().Single(item => (string)item.Header == domain).RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent)); window.UpdateLayout();
+        Assert(Find<TextBox>(window, "Address")!.Text == domain, "migrated public entry can be selected"); await VerifyQrAsync(window, client, domain);
+        menu.Items.OfType<MenuItem>().Single(item => (string)item.Header == previous).RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent)); window.UpdateLayout(); await VerifyQrAsync(window, client, previous);
     }
     private sealed class VerificationUpdateHandler(Version version) : HttpMessageHandler
     {

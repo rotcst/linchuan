@@ -30,6 +30,9 @@ internal static class Program
             await LegacyServiceIsRejectedBeforeExtractionAsync(root);
             PublicUrlMetadataBoundaries(root);
             await ReuseRequiresMatchingPublicUrlAsync(root);
+            await ReuseRequiresMatchingGroupAsync(root);
+            await PendingServiceReuseAsync(root);
+            HostTransferPublicConfiguration(root);
             await UpdateCheckerValidationAsync();
             await NativeRequestIdentityAsync();
             HostTransferCryptography();
@@ -53,7 +56,7 @@ internal static class Program
         Assert(!UpdateChecker.TryReleaseUrl("https://user@github.com/rotcst/linchuan/releases/tag/v1.2.0", out _), "credential-bearing release URL rejected");
         Assert(!UpdateChecker.TryReleaseUrl("https://github.com:8443/rotcst/linchuan/releases/tag/v1.2.0", out _), "nonstandard release port rejected");
         Assert(!UpdateChecker.TryReleaseUrl("https://github.com/rotcst/linchuan/releases/other", out _), "non-tag release URL rejected");
-        using var handler = new StubHandler("{\"tag_name\":\"v1.2.0\",\"draft\":false,\"html_url\":\"https://github.com/rotcst/linchuan/releases/tag/v1.2.0\"}");
+        using var handler = new StubHandler("{\"tag_name\":\"v9.0.0\",\"draft\":false,\"html_url\":\"https://github.com/rotcst/linchuan/releases/tag/v9.0.0\"}");
         using var checker = new UpdateChecker(handler, TimeSpan.FromSeconds(2));
         var result = await checker.CheckAsync();
         Assert(result.Status == UpdateStatus.UpdateAvailable, "update availability status");
@@ -86,6 +89,59 @@ internal static class Program
         var envelopeHash = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(offer.EnvelopeJson)));
         var signed = $"linchuan-handoff-v1\n{offer.Id}\n{offer.GroupId}\n{offer.Generation}\n{offer.TargetDeviceId}\n{offer.TotalChunks}\n{offer.TotalBytes}\n{offer.Sha256}\n{envelopeHash}";
         offer.Signature = Convert.ToBase64String(keyPair.SignData(Encoding.UTF8.GetBytes(signed), HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1)); HostHandoff.VerifyOffer(offer, group);
+        var pendingRoot = Path.Combine(
+            Path.GetTempPath(),
+            "linchuan-pending-validation-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(pendingRoot);
+        try
+        {
+            var incoming = new HandoffPending { Offer = offer, DataDir = Path.Combine(pendingRoot, "groups", offer.GroupId + "-2") };
+            HostHandoff.ValidatePendingForStartup(incoming, group, pendingRoot);
+            HostHandoff.ValidatePendingForStartup(new HandoffPending { Offer = offer, Outgoing = true }, group, pendingRoot);
+            var wrongGroup = new GroupNetwork
+            {
+                Protocol = group.Protocol,
+                GroupId = Guid.NewGuid().ToString(),
+                PublicKey = group.PublicKey,
+                HostGeneration = group.HostGeneration,
+            };
+            AssertThrows<InvalidDataException>(
+                () => HostHandoff.ValidatePendingForStartup(incoming, wrongGroup, pendingRoot),
+                "pending错误组拒绝");
+            var wrongGeneration = new HandoffOffer
+            {
+                Id = offer.Id,
+                GroupId = offer.GroupId,
+                Generation = 3,
+                TargetDeviceId = offer.TargetDeviceId,
+                ReceivePort = offer.ReceivePort,
+                TotalChunks = offer.TotalChunks,
+                TotalBytes = offer.TotalBytes,
+                Sha256 = offer.Sha256,
+                EnvelopeJson = offer.EnvelopeJson,
+                Signature = offer.Signature,
+            };
+            AssertThrows<InvalidDataException>(
+                () => HostHandoff.ValidatePendingForStartup(new HandoffPending { Offer = wrongGeneration, Outgoing = true }, group, pendingRoot),
+                "pending错误代次拒绝");
+            var tampered = new HandoffOffer
+            {
+                Id = offer.Id,
+                GroupId = offer.GroupId,
+                Generation = offer.Generation,
+                TargetDeviceId = offer.TargetDeviceId,
+                ReceivePort = offer.ReceivePort,
+                TotalChunks = offer.TotalChunks,
+                TotalBytes = offer.TotalBytes,
+                Sha256 = offer.Sha256,
+                EnvelopeJson = offer.EnvelopeJson,
+                Signature = Convert.ToBase64String(RandomNumberGenerator.GetBytes(256)),
+            };
+            AssertThrows<InvalidDataException>(
+                () => HostHandoff.ValidatePendingForStartup(new HandoffPending { Offer = tampered, Outgoing = true }, group, pendingRoot),
+                "pending篡改拒绝");
+        }
+        finally { try { Directory.Delete(pendingRoot, true); } catch { } }
         offer.EnvelopeJson = "{\"tampered\":true}"; rejected = false; try { HostHandoff.VerifyOffer(offer, group); } catch (InvalidDataException) { rejected = true; } Assert(rejected, "密文头篡改拒绝");
         var key = RandomNumberGenerator.GetBytes(32); var prefix = RandomNumberGenerator.GetBytes(8); var plain = Encoding.UTF8.GetBytes("完整移交 synthetic credential");
         try
@@ -248,9 +304,64 @@ internal static class Program
             finally { listener.Stop(); }
         }
     }
+    private static async Task ReuseRequiresMatchingGroupAsync(string root)
+    {
+        var groupId = Guid.NewGuid().ToString();
+        foreach (var (advertisedGroup, generation, reuse) in new (string?, long, bool)[] { (groupId, 2, true), (Guid.NewGuid().ToString(), 2, false), (groupId, 1, false), (null, 0, false) })
+        {
+            var directory = Path.Combine(root, "reuse-group-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(directory);
+            using var listener = new TcpListener(IPAddress.Loopback, 0); listener.Start(); var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+            var reply = Task.Run(async () => { using var connection = await listener.AcceptTcpClientAsync(); await using var stream = connection.GetStream(); _ = await stream.ReadAsync(new byte[1024]); var body = JsonSerializer.SerializeToUtf8Bytes(new { serverName = "邻传", desktopApi = 3, groupId = advertisedGroup, hostGeneration = generation }); await stream.WriteAsync(Encoding.ASCII.GetBytes($"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n")); await stream.WriteAsync(body); });
+            await using var backend = new BackendHost(); var rejected = false;
+            try { Assert(!await backend.StartAsync(Path.Combine(directory, "app"), directory, port, true, expectedNetwork: new GroupNetwork { GroupId = groupId, HostGeneration = 2 }), "仅复用移交设备组的服务"); }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("本次移交的设备组", StringComparison.Ordinal)) { rejected = true; }
+            Assert(rejected == !reuse, "拒绝独立服务及旧主机代次"); await reply; Assert(!Directory.Exists(Path.Combine(directory, "app")), "拒绝其他服务时保留其程序与数据");
+        }
+    }
+    private static async Task PendingServiceReuseAsync(string root)
+    {
+        using var key = RSA.Create(2048);
+        var group = new GroupNetwork { Protocol = 1, GroupId = Guid.NewGuid().ToString(), PublicKey = Convert.ToBase64String(key.ExportSubjectPublicKeyInfo()), HostGeneration = 1 };
+        var offer = new HandoffOffer { Id = Guid.NewGuid().ToString("N"), GroupId = group.GroupId, Generation = 2, TargetDeviceId = Guid.NewGuid().ToString(), ReceivePort = 40000, TotalChunks = 1, TotalBytes = 17, Sha256 = new string('a', 64), EnvelopeJson = "{}" };
+        var envelopeHash = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(offer.EnvelopeJson)));
+        var signed = $"linchuan-handoff-v1\n{offer.Id}\n{offer.GroupId}\n{offer.Generation}\n{offer.TargetDeviceId}\n{offer.TotalChunks}\n{offer.TotalBytes}\n{offer.Sha256}\n{envelopeHash}";
+        offer.Signature = Convert.ToBase64String(key.SignData(Encoding.UTF8.GetBytes(signed), HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1));
+        foreach (var (outgoing, advertisedGroup, generation, reuse) in new (bool, string, long, bool)[] { (true, group.GroupId, 1, true), (true, group.GroupId, 2, true), (true, group.GroupId, 3, false), (true, Guid.NewGuid().ToString(), 2, false), (false, group.GroupId, 1, false), (false, group.GroupId, 2, true), (false, group.GroupId, 3, false), (false, Guid.NewGuid().ToString(), 2, false) })
+        {
+            var caseRoot = Path.Combine(root, "pending-reuse-" + Guid.NewGuid().ToString("N"));
+            var dataDir = outgoing ? caseRoot : Path.Combine(caseRoot, "groups", group.GroupId + "-2"); Directory.CreateDirectory(dataDir);
+            var pending = new HandoffPending { Offer = offer, Outgoing = outgoing, DataDir = outgoing ? "" : dataDir };
+            using var listener = new TcpListener(IPAddress.Loopback, 0); listener.Start(); var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+            var reply = Task.Run(async () =>
+            {
+                using var connection = await listener.AcceptTcpClientAsync(); await using var stream = connection.GetStream(); _ = await stream.ReadAsync(new byte[1024]);
+                var body = JsonSerializer.SerializeToUtf8Bytes(new { serverName = "邻传", desktopApi = 3, groupId = advertisedGroup, hostGeneration = generation });
+                await stream.WriteAsync(Encoding.ASCII.GetBytes($"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n")); await stream.WriteAsync(body);
+            });
+            await using var backend = new BackendHost(); var rejected = false;
+            try { Assert(!await backend.StartAsync(Path.Combine(caseRoot, "app"), dataDir, port, true, expectedNetwork: group, pendingHandoff: pending), "signed pending can resume matching service without extracting payload"); }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("本次移交的设备组", StringComparison.Ordinal)) { rejected = true; }
+            Assert(rejected == !reuse, "pending accepts only the source before/after commit or the activated target generation"); await reply;
+            Assert(!Directory.Exists(Path.Combine(caseRoot, "app")), "pending rejection preserves another service and its data");
+        }
+    }
+    private static void HostTransferPublicConfiguration(string root)
+    {
+        var directory = Path.Combine(root, "transfer-public"); Directory.CreateDirectory(directory);
+        const string domain = "https://transfer.example.test";
+        HostHandoff.ValidatePublicConfiguration(directory, null);
+        File.WriteAllText(Path.Combine(directory, "cloudflare.json"), JsonSerializer.Serialize(new { publicUrl = domain }));
+        var rejected = false; try { HostHandoff.ValidatePublicConfiguration(directory, null); } catch (InvalidDataException) { rejected = true; } Assert(rejected, "本机公网配置不能在路由元数据为空时被静默跳过");
+        rejected = false; try { HostHandoff.ValidatePublicConfiguration(directory, domain); } catch (InvalidDataException) { rejected = true; } Assert(rejected, "有域名却无凭据不能提交完整移交");
+        var plain = Encoding.UTF8.GetBytes("synthetic-fixture-token");
+        try { File.WriteAllBytes(Path.Combine(directory, "tunnel-token.dpapi"), ProtectedData.Protect(plain, null, DataProtectionScope.CurrentUser)); HostHandoff.ValidatePublicConfiguration(directory, domain); }
+        finally { CryptographicOperations.ZeroMemory(plain); }
+        File.Delete(Path.Combine(directory, "cloudflare.json"));
+        rejected = false; try { HostHandoff.ValidatePublicConfiguration(directory, domain); } catch (InvalidDataException) { rejected = true; } Assert(rejected, "接收恢复缺少公网配置必须明确拒绝");
+    }
     private static void PublicUrlMetadataBoundaries(string root)
     {
-        var method = typeof(BackendHost).GetMethod("ReadPublicUrl", BindingFlags.NonPublic | BindingFlags.Static)!;
+        var method = typeof(BackendHost).GetMethod("ReadPublicUrl", BindingFlags.Public | BindingFlags.Static)!;
         var path = Path.Combine(root, "public-url-data"); Directory.CreateDirectory(path);
         string? Read(string json)
         {
@@ -435,5 +546,12 @@ internal static class Program
     private static void Assert(bool condition, string name)
     {
         if (!condition) throw new InvalidOperationException("测试失败: " + name);
+    }
+
+    private static void AssertThrows<T>(Action action, string name) where T : Exception
+    {
+        try { action(); }
+        catch (T) { return; }
+        throw new InvalidOperationException("测试失败: " + name);
     }
 }

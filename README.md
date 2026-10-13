@@ -1,5 +1,11 @@
 # Linchuan
 
+### Public entry preservation after transfer (1.2.1)
+
+The public origin is persisted with the group snapshot. A complete transfer validates the origin and protected credential, then checks the destination group and generation before activation. Both PCs retain the public entry after transfer and the new host retains it after restart. Upgrade both Windows PCs. Preserve original data after a failed transfer and resume or retry the complete transfer; manually joining another service is not a completed migration. Upgrading cannot create Cloudflare credentials for an independent new group.
+
+An incomplete recovery record left by 1.2.0 requires separate recovery. Unsigned records are rejected; preserve the original `data` and `desktop` directories.
+
 Linchuan connects computers and phones over a home network or an optional HTTPS Cloudflare Tunnel. Windows uses a native C# WPF app; phones use the web interface. Both share device presence, public and private chat, persistent files, and media previews. The Windows app contains no WebView or embedded browser.
 
 [简体中文](README.zh-CN.md) · [한국어](README.ko.md) · [日本語](README.ja.md) · [Windows downloads](https://github.com/rotcst/linchuan/releases) · [Security](SECURITY.md) · [Design system](design/设计说明.md)

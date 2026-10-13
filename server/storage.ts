@@ -129,6 +129,18 @@ export class Storage {
       .get(key) as { value?: unknown } | undefined;
     return typeof row?.value === 'string' ? row.value : undefined;
   }
+  getNetworkPublicUrl(): string | undefined {
+    return this.getMetadata('network.publicUrl');
+  }
+  setNetworkPublicUrl(value: string | null) {
+    if (value === null) {
+      this.db
+        .prepare("DELETE FROM metadata WHERE key='network.publicUrl'")
+        .run();
+      return;
+    }
+    this.setMetadata('network.publicUrl', value);
+  }
   setMetadata(key: string, value: string) {
     this.db
       .prepare('INSERT OR REPLACE INTO metadata(key,value) VALUES(?,?)')

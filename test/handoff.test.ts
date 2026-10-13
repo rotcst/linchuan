@@ -53,6 +53,7 @@ test('handoff full server protocol freezes, exports, commits and survives restar
     host: '127.0.0.1',
     dataDir: dir,
     joinCode: '123456',
+    publicUrl: 'https://transfer.example.test/source-path',
     handoffTtlMs: 2000,
   });
   await lan.start();
@@ -214,7 +215,14 @@ test('handoff full server protocol freezes, exports, commits and survives restar
       headers: { ...hostHeaders, 'content-type': 'application/json' },
       body: JSON.stringify({ targetDeviceId: target.device.id }),
     })
-  ).value as { id: string };
+  ).value as {
+    id: string;
+    groupId: string;
+    generation: number;
+    targetDeviceId: string;
+    targetPublicKey: string;
+    receivePort: number;
+  };
   assert.equal(
     (
       await json(`${base}/api/messages`, {
@@ -296,6 +304,45 @@ test('handoff full server protocol freezes, exports, commits and survives restar
       })
     ).status,
     204,
+  );
+  const sealedStatus = (
+    await json(`${base}/api/host/handoff/status?id=${prepared.id}`, {
+      headers: hostHeaders,
+    })
+  ).value as {
+    id: string;
+    groupId: string;
+    generation: number;
+    targetDeviceId: string;
+    targetPublicKey: string;
+    receivePort: number;
+    state: string;
+    totalChunks: number;
+    totalBytes: number;
+    sha256: string;
+    signature: string;
+  };
+  assert.equal(sealedStatus.state, 'offered');
+  assert.equal(sealedStatus.id, prepared.id);
+  assert.equal(sealedStatus.groupId, prepared.groupId);
+  assert.equal(sealedStatus.generation, prepared.generation);
+  assert.equal(sealedStatus.targetDeviceId, prepared.targetDeviceId);
+  assert.equal(sealedStatus.targetPublicKey, prepared.targetPublicKey);
+  assert.equal(sealedStatus.receivePort, prepared.receivePort);
+  assert.equal(sealedStatus.totalChunks, 1);
+  assert.equal(sealedStatus.totalBytes, chunk.length);
+  assert.equal(
+    sealedStatus.sha256,
+    crypto.createHash('sha256').update(chunk).digest('hex'),
+  );
+  assert.ok(sealedStatus.signature.length > 0);
+  assert.equal(
+    (
+      await fetch(`${base}/api/host/handoff/status?id=${prepared.id}`, {
+        headers: { authorization: `Bearer ${source.token}` },
+      })
+    ).status,
+    403,
   );
   const downloadedChunk = await fetch(`${base}/api/handoff/chunks/0`, {
     headers: { authorization: `Bearer ${target.token}` },
@@ -449,6 +496,24 @@ test('handoff full server protocol freezes, exports, commits and survives restar
   });
   await migrated.start();
   const migratedBase = `http://127.0.0.1:${migrated.getPort()}`;
+  const migratedInfo = (await (
+    await fetch(`${migratedBase}/api/info`)
+  ).json()) as {
+    publicUrl: string;
+    urls: string[];
+    groupId: string;
+    hostGeneration: number;
+  };
+  assert.equal(migratedInfo.publicUrl, 'https://transfer.example.test');
+  assert.ok(migratedInfo.urls.includes(migratedInfo.publicUrl));
+  assert.equal(migratedInfo.hostGeneration, prepared.generation ?? 2);
+  const migratedNetwork = (await (
+    await fetch(`${migratedBase}/api/network`, {
+      headers: { authorization: `Bearer ${target.token}` },
+    })
+  ).json()) as { publicUrl: string; internet: string; hostGeneration: number };
+  assert.equal(migratedNetwork.publicUrl, migratedInfo.publicUrl);
+  assert.notEqual(migratedNetwork.internet, 'connected');
   const restored = await json(`${migratedBase}/api/network/browser-restore`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -492,6 +557,10 @@ test('handoff full server protocol freezes, exports, commits and survives restar
   ).value as { state: string; activated: boolean };
   assert.equal(status.state, 'committed');
   assert.equal(status.activated, true);
+  const restartedInfo = (await (
+    await fetch(`http://127.0.0.1:${restarted.getPort()}/api/info`)
+  ).json()) as { publicUrl: string };
+  assert.equal(restartedInfo.publicUrl, 'https://transfer.example.test');
 });
 
 test('handoff abort and expiry restore writes and remove staging', async (t) => {
@@ -501,7 +570,8 @@ test('handoff abort and expiry restore writes and remove staging', async (t) => 
     host: '127.0.0.1',
     dataDir: dir,
     joinCode: '654321',
-    handoffTtlMs: 200,
+    // Allow scheduling slack for parallel RSA/SQLite fixtures before abort.
+    handoffTtlMs: 2000,
   });
   await lan.start();
   const base = `http://127.0.0.1:${lan.getPort()}`;
@@ -633,7 +703,7 @@ test('handoff abort and expiry restore writes and remove staging', async (t) => 
       body: JSON.stringify({ targetDeviceId: target.device.id }),
     })
   ).value as { id: string };
-  await new Promise((resolve) => setTimeout(resolve, 320));
+  await new Promise((resolve) => setTimeout(resolve, 2120));
   assert.equal(
     (
       await json(`${base}/api/messages`, {

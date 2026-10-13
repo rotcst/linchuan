@@ -298,5 +298,6 @@
   "移交密文校验失败。": "Encrypted host data verification failed.",
   "移交来源地址无效。": "Invalid host transfer source address.",
   "新主机没有可用连接入口。": "The new host has no available connection address.",
-  "旧版邻传服务仍在运行，请先退出旧版邻传再启动新版。": "An older service is running. Quit it before starting this version."
+  "旧版邻传服务仍在运行，请先退出旧版邻传再启动新版。": "An older service is running. Quit it before starting this version.",
+  "现有服务不属于本次移交的设备组，请先退出该服务再重试。数据会保留。": "The running service does not belong to this host transfer. Exit that service and retry. Your data will be kept."
 }

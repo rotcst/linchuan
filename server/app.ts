@@ -109,11 +109,6 @@ export function createLanServer(options: LanServerOptions) {
   const handoffTtlMs = options.handoffTtlMs ?? 10 * 60 * 1000;
   const diskStatfs =
     options.diskStatfs ?? (() => fsp.statfs(uploadDir, { bigint: true }));
-  const publicUrl = options.publicUrl
-    ? new URL(options.publicUrl).origin
-    : null;
-  if (publicUrl && !publicUrl.startsWith('https://'))
-    throw new Error('互联网入口必须使用 HTTPS。');
   let joinCode =
     options.joinCode ??
     process.env.JOIN_CODE ??
@@ -126,6 +121,14 @@ export function createLanServer(options: LanServerOptions) {
   if (fs.lstatSync(uploadDir).isSymbolicLink())
     throw new Error('上传目录不能是符号链接。');
   const storage = new Storage(options.dataDir);
+  const publicUrlValue =
+    options.publicUrl !== undefined
+      ? options.publicUrl
+      : storage.getNetworkPublicUrl();
+  const publicUrl = publicUrlValue ? new URL(publicUrlValue).origin : null;
+  if (publicUrl && !publicUrl.startsWith('https://'))
+    throw new Error('互联网入口必须使用 HTTPS。');
+  if (options.publicUrl !== undefined) storage.setNetworkPublicUrl(publicUrl);
   const networkIdentity = storage.loadOrCreateNetworkIdentity();
   const removeHandoffStaging = (handoffId: string) => {
     if (!/^[A-Za-z0-9_-]+$/.test(handoffId))
@@ -835,6 +838,8 @@ export function createLanServer(options: LanServerOptions) {
   app.get('/api/info', (_request, response) =>
     response.json({
       serverName: '邻传',
+      groupId: networkIdentity.groupId,
+      hostGeneration: networkIdentity.hostGeneration,
       urls: [...ownUrls(), ...(publicUrl ? [publicUrl] : [])],
       expiresHours: Number.isFinite(expiryMs) ? expiryMs / 3600000 : null,
       persistent: true,
@@ -1551,8 +1556,11 @@ export function createLanServer(options: LanServerOptions) {
     }
     response.json({
       id: handoff.id,
+      groupId: networkIdentity.groupId,
       generation: handoff.generation,
       targetDeviceId: handoff.targetDeviceId,
+      targetPublicKey: handoff.targetPublicKey,
+      receivePort: handoff.receivePort,
       state: handoff.committed
         ? 'committed'
         : handoff.ready
@@ -1560,6 +1568,8 @@ export function createLanServer(options: LanServerOptions) {
           : handoff.offer
             ? 'offered'
             : 'preparing',
+      ...(handoff.offer ?? {}),
+      urls: handoff.redirectUrls ?? [],
       activated: handoff.activated,
       redirectUrls: handoff.redirectUrls ?? [],
     });

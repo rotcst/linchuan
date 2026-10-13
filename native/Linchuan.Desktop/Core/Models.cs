@@ -55,6 +55,8 @@ public sealed class SessionInfo
 public sealed class ServerInfo
 {
     public int DesktopApi { get; set; }
+    public string? GroupId { get; set; }
+    public long HostGeneration { get; set; }
     public string ServerName { get; set; } = string.Empty;
     public List<string> Urls { get; set; } = [];
     public double? ExpiresHours { get; set; }
